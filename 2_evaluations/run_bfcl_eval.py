@@ -150,9 +150,22 @@ class BFCLEvaluator(Evaluator):
         self._run(cmd, env=env)
 
     def compute_metrics(self, predictions: None = None) -> None:
-        """`bfcl evaluate` scores the generated results, then `bfcl scores` prints the
-        leaderboard. `predictions` is unused — bfcl reads run_predictions' output back
-        from disk (--result-dir) itself rather than taking it in-process.
+        """`bfcl evaluate` scores the generated results and writes one
+        BFCL_v3_<category>_score.json per category — everything log_bfcl_to_mlflow.py's
+        read_category_summaries() needs. `predictions` is unused — bfcl reads
+        run_predictions' output back from disk (--result-dir) itself rather than taking
+        it in-process.
+
+        Deliberately does NOT call `bfcl scores`: that subcommand builds a fixed-column
+        leaderboard table (data_non_live.csv etc.) that unconditionally expects an
+        "exec_*" category column ("Non-Live Exec Acc") to exist — `bfcl
+        __main__.py:scores`, `headers.index(col) for col in selected_columns` with no
+        guard. This project's test_category ("python") only ever runs the
+        non-exec/non-multi-turn categories (see category_mapping.py — the exec_* entries
+        are commented out), so that column never exists and `bfcl scores` crashes with
+        `ValueError: 'Non-Live Exec Acc' is not in list` every time, regardless of how
+        much of the suite finished. Confirmed for real running this against a live
+        result set. Nothing here reads its CSV output anyway.
         """
         evaluate_cmd = ["bfcl", "evaluate", "--model", self.model, "--test-category", self.test_category]
         if self.result_dir:
@@ -160,11 +173,6 @@ class BFCLEvaluator(Evaluator):
         if self.score_dir:
             evaluate_cmd += ["--score-dir", self.score_dir]
         self._run(evaluate_cmd)
-
-        scores_cmd = ["bfcl", "scores"]
-        if self.score_dir:
-            scores_cmd += ["--score-dir", self.score_dir]
-        self._run(scores_cmd)
 
     @staticmethod
     def _run(cmd: list[str], env: dict[str, str] | None = None) -> None:

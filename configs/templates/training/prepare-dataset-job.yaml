@@ -1,0 +1,81 @@
+# One-shot dataset preparation: downloads Team-ACE/ToolACE from the HF Hub and writes
+# train/val/test.jsonl (0_data/prepare_dataset.py) to a PVC that smoke-test-job.yaml,
+# sft-job.yaml, and grpo-job.yaml all mount read-only afterward. A single source of
+# prepared data instead of each training job re-running prepare_dataset.py itself, or the
+# user hand-building per-job data ConfigMaps from a local run of it.
+#
+# Also slices the smoke-test-sized samples (smoke_train.jsonl, smoke_val.jsonl) here,
+# once, rather than each smoke job re-slicing the full train/val files itself on every
+# run — smoke-test-job.yaml and grpo-job.yaml both just read smoke_train.jsonl directly.
+#
+# Prerequisite: run setup/setup.sh first (creates the namespace this lives in).
+#
+# Build the source ConfigMap before applying:
+#   kubectl create configmap fin-agent-data-prep-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py
+#
+# Run this before any of the training jobs below, and wait for it to finish:
+#   kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#   kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
+#
+# Deterministic/seeded (prepare_dataset.py's own --seed default) -- rerunning this Job
+# regenerates the exact same splits byte-for-byte, so it's safe to rerun if the PVC
+# ever needs rebuilding; the training jobs don't care which run produced their data.
+#
+# Clean up (Jobs don't self-delete; the PVC is deliberately left in place -- the
+# training jobs below depend on it staying populated):
+#   kubectl -n fin-agent delete job fin-agent-prepare-dataset
+#   kubectl -n fin-agent delete configmap fin-agent-data-prep-src
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fin-agent-dataset
+  namespace: fin-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 2Gi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-prepare-dataset
+  namespace: fin-agent
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 1800   # HF Hub download + local processing -- minutes, not hours
+  template:
+    metadata:
+      labels: { app: fin-agent-prepare-dataset }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: prepare-dataset
+          image: python:3.12-slim   # no GPU/torch needed here -- just the `datasets` library and local text processing
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir datasets
+              cp /src/*.py /workspace/
+              python3 prepare_dataset.py --output-dir /data/prepared
+              head -20 /data/prepared/train.jsonl > /data/prepared/smoke_train.jsonl
+              head -8 /data/prepared/val.jsonl > /data/prepared/smoke_val.jsonl
+              echo "--- prepared dataset ---"
+              wc -l /data/prepared/*.jsonl
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: dataset, mountPath: /data/prepared }
+          resources:
+            requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 4Gi }
+            limits: { cpu: "2", memory: 4Gi, ephemeral-storage: 8Gi }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-data-prep-src }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }

@@ -12,8 +12,7 @@
 # Build the source ConfigMap before applying:
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
-#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py \
-#     --from-file=poll_bfcl_progress.py=2_evaluations/poll_bfcl_progress.py
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
 #
 # Run — prefer ./run-bfcl-eval.sh, which applies the vLLM server this Job depends on,
 # waits for it to be Ready, and only then applies this Job (applying this file alone
@@ -43,9 +42,11 @@
 # for this model today (kept for consistency), and real throughput is bounded by vLLM's
 # own server-side batching.
 #
-# poll_bfcl_progress.py runs as a background process alongside log_bfcl_to_mlflow.py,
-# logging generation-progress gauges every interval and per-category accuracy as soon as
-# each category's result file is fully generated, into the same MLflow run.
+# log_bfcl_to_mlflow.py runs generate -> evaluate -> reads each category's score file ->
+# logs everything to MLflow in one run, once the whole suite finishes. (An earlier version
+# of this job also ran poll_bfcl_progress.py in the background for interval progress
+# logging; removed for simplicity — the PVC + resume-by-id + run-id-file resumability
+# below doesn't depend on it.)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -103,10 +104,9 @@ spec:
                   raise SystemExit('vLLM server did not become ready in time — apply ../inference/vllm-qwen3-8b.yaml first')
               "
 
-              RUN_ID_FILE=/data/bfcl/mlflow_run_id.txt
-              STOP_FILE=/tmp/bfcl-poll-stop
-              rm -f "$STOP_FILE"
-
+              # --run-id-file lets a retried pod (backoffLimit above) resume logging into
+              # the same MLflow run instead of starting a new one each attempt — the file
+              # lives on the PVC so it survives a pod restart.
               python3 log_bfcl_to_mlflow.py \
                 --model Qwen/Qwen3-8B --test-category python \
                 --skip-server-setup --num-threads 32 \
@@ -114,27 +114,7 @@ spec:
                 --bfcl-project-root /data/bfcl \
                 --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-bfcl \
-                --run-id-file "$RUN_ID_FILE" &
-              MAIN_PID=$!
-
-              until [ -s "$RUN_ID_FILE" ]; do
-                sleep 2
-                kill -0 "$MAIN_PID" 2>/dev/null || { echo "main process exited before writing a run id"; wait "$MAIN_PID"; exit $?; }
-              done
-
-              python3 poll_bfcl_progress.py \
-                --model Qwen/Qwen3-8B --test-category python \
-                --bfcl-project-root /data/bfcl \
-                --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
-                --mlflow-experiment-name fin-agent-bfcl \
-                --mlflow-run-id "$(cat "$RUN_ID_FILE")" \
-                --interval 60 --stop-file "$STOP_FILE" &
-              POLL_PID=$!
-
-              wait "$MAIN_PID"; MAIN_STATUS=$?
-              touch "$STOP_FILE"
-              wait "$POLL_PID"
-              exit $MAIN_STATUS
+                --run-id-file /data/bfcl/mlflow_run_id.txt
           volumeMounts:
             - { name: src, mountPath: /src }
             - { name: bfcl-data, mountPath: /data/bfcl }

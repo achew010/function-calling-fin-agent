@@ -9,27 +9,33 @@
 # train_sft.py's own defaults (epoch-based, full dataset) are unchanged and are what the
 # real run uses. Only change these values here, never in train_sft.py itself.
 #
-# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
+#   2. prepare-dataset-job.yaml, run to completion first — this reads a 20/8-example
+#      slice (head of the real prepared splits, not fabricated) straight off the shared
+#      PVC it populates, rather than a separately hand-built data ConfigMap:
+#        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
 #
-# Code + a 20/8-example real-data slice (head of the real prepared splits, not
-# fabricated) ship as ConfigMaps and get pip-installed at pod start, rather than baking a
-# custom image — these files are all small text (well under the 1MiB ConfigMap limit).
-# Build them from the fin_agent project root before applying this job:
+# Code ships as a ConfigMap and gets pip-installed at pod start, rather than baking a
+# custom image. Dependencies are installed via tox (tox.ini at the project root,
+# sft/grpo share it) — sitepackages=true so it layers transformers/peft/trl/etc. on top
+# of the base image's already-installed, GPU-matched torch instead of pip installing a
+# fresh (CUDA-mismatched) one into an isolated venv. Build the ConfigMap from the
+# fin_agent project root before applying this job:
 #
 #   kubectl create configmap fin-agent-sft-src -n fin-agent \
 #     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
 #     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
 #     --from-file=metrics.py=1_training/1_sft/metrics.py \
-#     --from-file=train_sft.py=1_training/1_sft/train_sft.py
-#   kubectl create configmap fin-agent-smoke-data -n fin-agent \
-#     --from-file=train.jsonl=<(head -20 0_data/data/train.jsonl) \
-#     --from-file=val.jsonl=<(head -8 0_data/data/val.jsonl)
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py \
+#     --from-file=tox.ini=tox.ini
 #
 # Run:    kubectl apply -f configs/templates/training/smoke-test-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
 # Clean up (Jobs don't self-delete):
 #   kubectl -n fin-agent delete job fin-agent-sft-smoke-test
-#   kubectl -n fin-agent delete configmap fin-agent-sft-src fin-agent-smoke-data
+#   kubectl -n fin-agent delete configmap fin-agent-sft-src
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -58,16 +64,12 @@ spec:
             - -c
             - |
               set -e
-              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
-                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
-                "jinja2>=3.1.0" mlflow
-              mkdir -p /workspace/data
-              cp /src/*.py /workspace/
-              cp /data/train.jsonl /data/val.jsonl /workspace/data/
-              python3 train_sft.py \
+              pip install --no-cache-dir tox
+              cp /src/* /workspace/
+              tox -e sft -- train_sft.py \
                 --base-model Qwen/Qwen3-8B \
-                --train-file /workspace/data/train.jsonl \
-                --val-file /workspace/data/val.jsonl \
+                --train-file /data/prepared/smoke_train.jsonl \
+                --val-file /data/prepared/smoke_val.jsonl \
                 --output-dir /workspace/checkpoints/smoke-test \
                 --max-steps 10 \
                 --per-device-batch-size 1 --grad-accum 1 \
@@ -87,12 +89,12 @@ spec:
             limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
           volumeMounts:
             - { name: src, mountPath: /src }
-            - { name: data, mountPath: /data }
+            - { name: dataset, mountPath: /data/prepared, readOnly: true }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
       volumes:
         - name: src
           configMap: { name: fin-agent-sft-src }
-        - name: data
-          configMap: { name: fin-agent-smoke-data }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }
         - name: hf-cache
           hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

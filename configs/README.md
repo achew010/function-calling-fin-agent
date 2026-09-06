@@ -22,6 +22,7 @@ configs/
 | `setup/nvidia-runtimeclass.yaml`, `setup/nvidia-device-plugin.yaml` | Let Kubernetes schedule against the GPU (`nvidia.com/gpu`). Applied by `setup.sh`; no time-slicing — one GPU, one workload at a time, matching how the templates below are designed to be run. |
 | `setup/namespace.yaml` | The `fin-agent` namespace everything else lives in. |
 | `setup/mlflow.yaml` | Self-contained MLflow (ClusterIP + SQLite + hostPath) — a fresh instance for this VM, not tied to any external ingress hostname. |
+| `templates/training/prepare-dataset-job.yaml` | Runs `0_data/prepare_dataset.py` once, writing train/val/test.jsonl to a shared PVC (`fin-agent-dataset`). Run this before any other training job below — they all read from it. |
 | `templates/training/smoke-test-job.yaml` | SFT smoke test — 10 training steps, a step-based eval, and a checkpoint save. |
 | `templates/training/sft-job.yaml` | The real SFT run — full ToolACE-derived dataset, `train_sft.py`'s own defaults (3 epochs, epoch-based eval/save), checkpoint persisted to hostPath. |
 | `templates/training/grpo-job.yaml` | GRPO smoke test — dataset construction, reward function, rollout generation, and a checkpoint save. |
@@ -34,22 +35,26 @@ configs/
 ```bash
 ./setup/setup.sh
 
-# from the fin_agent project root:
+# from the fin_agent project root — prepares train/val/test.jsonl (+ smoke-sized
+# slices) once, onto a PVC every training job below reads from:
+kubectl create configmap fin-agent-data-prep-src -n fin-agent \
+  --from-file=prepare_dataset.py=0_data/prepare_dataset.py
+kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
+
 kubectl create configmap fin-agent-sft-src -n fin-agent \
   --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
   --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
   --from-file=metrics.py=1_training/1_sft/metrics.py \
-  --from-file=train_sft.py=1_training/1_sft/train_sft.py
-kubectl create configmap fin-agent-smoke-data -n fin-agent \
-  --from-file=train.jsonl=<(head -20 0_data/data/train.jsonl) \
-  --from-file=val.jsonl=<(head -8 0_data/data/val.jsonl)
+  --from-file=train_sft.py=1_training/1_sft/train_sft.py \
+  --from-file=tox.ini=tox.ini
 
 kubectl apply -f configs/templates/training/smoke-test-job.yaml
 kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
 ```
 
 Once the smoke test passes, the real run reuses the same `fin-agent-sft-src` ConfigMap
-(no separate ConfigMap needed — it prepares the full dataset itself at pod start):
+and the same prepared-dataset PVC (no separate ConfigMap or re-prep needed):
 
 ```bash
 kubectl apply -f configs/templates/training/sft-job.yaml
@@ -59,8 +64,9 @@ kubectl -n fin-agent logs -l app=fin-agent-sft -f
 For the BFCL benchmark, build its ConfigMap (command in
 `templates/inference/bfcl-eval-job.yaml`'s header) then run
 `./templates/inference/run-bfcl-eval.sh` — it takes care of bringing up the vLLM
-deployment first. `templates/training/grpo-job.yaml` follows the same ConfigMap-then-apply
-pattern as the SFT smoke test; see its own header.
+deployment first. `templates/training/grpo-job.yaml` follows the same
+ConfigMap-then-apply pattern as the SFT smoke test (and reads the same prepared-dataset
+PVC); see its own header.
 
 ## Design notes (why this looks the way it does)
 
@@ -75,11 +81,13 @@ pattern as the SFT smoke test; see its own header.
   wants an OpenAI-compatible endpoint at it), but applying the eval Job alone still does
   nothing useful without the server already running — hence `run-bfcl-eval.sh` as the
   actual entry point for that benchmark.
-- **The real SFT run regenerates its own dataset rather than shipping it.** ToolACE-derived
-  train/val/test splits run well past the ~1MiB ConfigMap size limit, so
-  `sft-job.yaml` runs `0_data/prepare_dataset.py` at pod start (deterministic, seeded,
-  no local files needed beyond the HF Hub download) instead of trying to ship prepared
-  data — the smoke test's own truncated ConfigMap slice is only for that quick check.
+- **Dataset preparation is a job of its own, not baked into every training job.**
+  ToolACE-derived train/val/test splits run well past the ~1MiB ConfigMap size limit, so
+  `prepare-dataset-job.yaml` runs `0_data/prepare_dataset.py` once (deterministic,
+  seeded — reruns produce byte-identical splits) onto a shared PVC that
+  `smoke-test-job.yaml`, `sft-job.yaml`, and `grpo-job.yaml` all mount read-only. The
+  smoke-sized slices (`smoke_train.jsonl`, `smoke_val.jsonl`) are cut once there too,
+  rather than each smoke job re-slicing the full files on every run.
 - **No node labels, no hostname pinning.** Every `nodeSelector` that referenced a
   specific machine name was removed — Kubernetes schedules purely on the
   `nvidia.com/gpu` resource request, which is what makes this "usable anywhere" rather

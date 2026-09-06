@@ -15,24 +15,29 @@
 # use_vllm defaults to False, so rollout generation happens via the policy model's own
 # .generate() in-process.
 #
-# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
+#   2. prepare-dataset-job.yaml, run to completion first — this reads a 20-example slice
+#      (head of the real prepared train split) straight off the shared PVC it populates:
+#        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
 #
 # Build the source ConfigMap before applying (GRPO needs the same two upstream files SFT
 # does, since it reuses run_internal_eval.py's instance builder, which itself imports
-# prepare_dataset.py's call-syntax parser):
+# prepare_dataset.py's call-syntax parser — plus tox.ini, reusing the same [testenv:grpo]
+# defined alongside SFT's; see tox.ini's header for why sitepackages=true matters here):
 #
 #   kubectl create configmap fin-agent-grpo-src -n fin-agent \
 #     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
 #     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
-#     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py
-#   kubectl create configmap fin-agent-grpo-data -n fin-agent \
-#     --from-file=train.jsonl=<(head -20 0_data/data/train.jsonl)
+#     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
+#     --from-file=tox.ini=tox.ini
 #
 # Run:    kubectl apply -f configs/templates/training/grpo-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo-smoke-test -f
 # Clean up (Jobs don't self-delete):
 #   kubectl -n fin-agent delete job fin-agent-grpo-smoke-test
-#   kubectl -n fin-agent delete configmap fin-agent-grpo-src fin-agent-grpo-data
+#   kubectl -n fin-agent delete configmap fin-agent-grpo-src
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -56,15 +61,11 @@ spec:
             - -c
             - |
               set -e
-              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
-                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
-                "jinja2>=3.1.0" mlflow
-              mkdir -p /workspace/data
-              cp /src/*.py /workspace/
-              cp /data/train.jsonl /workspace/data/
-              python3 train_grpo.py \
+              pip install --no-cache-dir tox
+              cp /src/* /workspace/
+              tox -e grpo -- train_grpo.py \
                 --base-model Qwen/Qwen3-8B \
-                --train-file /workspace/data/train.jsonl \
+                --train-file /data/prepared/smoke_train.jsonl \
                 --output-dir /workspace/checkpoints/grpo-smoke-test \
                 --max-steps 6 \
                 --num-generations 2 --per-device-batch-size 2 \
@@ -83,12 +84,12 @@ spec:
             limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
           volumeMounts:
             - { name: src, mountPath: /src }
-            - { name: data, mountPath: /data }
+            - { name: dataset, mountPath: /data/prepared, readOnly: true }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
       volumes:
         - name: src
           configMap: { name: fin-agent-grpo-src }
-        - name: data
-          configMap: { name: fin-agent-grpo-data }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }
         - name: hf-cache
           hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

@@ -6,19 +6,28 @@
 # Not alongside anything in ../inference/ or grpo-job.yaml — this project targets a
 # single GPU running one workload at a time.
 #
-# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
+#   2. prepare-dataset-job.yaml, run to completion first -- ToolACE's full train/val/test
+#      splits run well past the ~1MiB ConfigMap size limit, so this project prepares them
+#      once into a shared PVC (fin-agent-dataset) rather than each training job (or this
+#      one) re-running prepare_dataset.py itself or ConfigMapping the data in:
+#        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
 #
-# Unlike the smoke test, this job doesn't need a data ConfigMap: ToolACE's full
-# train/val/test splits run well past the ~1MiB ConfigMap size limit, so this runs
-# 0_data/prepare_dataset.py itself at pod start (deterministic, seeded — same splits
-# every time) rather than trying to ship prepared data in. It does reuse the same source
-# ConfigMap smoke-test-job.yaml builds:
+# This job's own source still reuses the same ConfigMap smoke-test-job.yaml builds
+# (including tox.ini — dependencies are installed via tox, sitepackages=true so it
+# layers onto the base image's GPU-matched torch instead of pip installing a fresh one
+# into an isolated venv; see tox.ini's header). prepare_dataset.py is still needed here
+# even though its CLI isn't invoked anymore: train_sft.py imports its call-syntax parser
+# directly (try_parse_calls).
 #
 #   kubectl create configmap fin-agent-sft-src -n fin-agent \
 #     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
 #     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
 #     --from-file=metrics.py=1_training/1_sft/metrics.py \
-#     --from-file=train_sft.py=1_training/1_sft/train_sft.py
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py \
+#     --from-file=tox.ini=tox.ini
 #
 # The checkpoint is written to hostPath (like hf-cache and mlflow's own data elsewhere in
 # this project) rather than the container's ephemeral storage, since it's the actual
@@ -55,16 +64,13 @@ spec:
             - -c
             - |
               set -e
-              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
-                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
-                "jinja2>=3.1.0" mlflow
-              cp /src/*.py /workspace/
-              mkdir -p /workspace/data /checkpoints/sft
-              python3 prepare_dataset.py --output-dir /workspace/data
-              python3 train_sft.py \
+              pip install --no-cache-dir tox
+              cp /src/* /workspace/
+              mkdir -p /checkpoints/sft
+              tox -e sft -- train_sft.py \
                 --base-model Qwen/Qwen3-8B \
-                --train-file /workspace/data/train.jsonl \
-                --val-file /workspace/data/val.jsonl \
+                --train-file /data/prepared/train.jsonl \
+                --val-file /data/prepared/val.jsonl \
                 --output-dir /checkpoints/sft \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-sft
@@ -80,6 +86,7 @@ spec:
             - { name: src, mountPath: /src }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
             - { name: checkpoints, mountPath: /checkpoints }
+            - { name: dataset, mountPath: /data/prepared, readOnly: true }
       volumes:
         - name: src
           configMap: { name: fin-agent-sft-src }
@@ -87,3 +94,5 @@ spec:
           hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }
         - name: checkpoints
           hostPath: { path: /var/lib/fin-agent/checkpoints, type: DirectoryOrCreate }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }

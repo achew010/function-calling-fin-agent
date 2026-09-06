@@ -95,6 +95,7 @@ echo ">> Creating namespace and deploying MLflow"
 kubectl apply -f "${SCRIPT_DIR}/namespace.yaml"
 kubectl apply -f "${SCRIPT_DIR}/mlflow.yaml"
 kubectl -n fin-agent rollout status deploy/mlflow --timeout=180s
+kubectl config set-context --current --namespace=fin-agent
 
 echo ""
 echo "=============================================================="
