@@ -1,0 +1,112 @@
+# The real GRPO run (1_training/2_grpo/train_grpo.py) — full ToolACE-derived dataset,
+# train_grpo.py's own defaults (num_generations=8, per_device_batch_size=8,
+# max_completion_length=512, 1 epoch, epoch-based save), warm-started from the real SFT
+# checkpoint (sft-job.yaml's output), not grpo-job.yaml's smoke-test overrides or the raw
+# base model. Run grpo-job.yaml (the smoke test) first to prove the pipeline and the
+# checkpoint handoff both work end-to-end before committing GPU hours to this one.
+#
+# Not alongside anything in ../inference/ or another file in this directory — this
+# project targets a single GPU running one workload at a time.
+#
+# Named grpo-real-job.yaml (not grpo-job.yaml) specifically to avoid colliding with the
+# existing smoke test's filename — grpo-job.yaml predates this file and is left as-is.
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
+#   2. prepare-dataset-job.yaml, run to completion first:
+#        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
+#   3. sft-job.yaml, run to completion first — --base-model below loads its checkpoint
+#      directly (a merged, standalone model, not a bare adapter — see train_sft.py):
+#        kubectl apply -f configs/templates/training/sft-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-sft --timeout=86400s
+#
+# Build the source ConfigMap before applying (same one grpo-job.yaml's smoke test uses):
+#   kubectl create configmap fin-agent-grpo-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
+#     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
+#     --from-file=tox.ini=tox.ini
+#
+# The checkpoint is written to hostPath (/var/lib/fin-agent/checkpoints/grpo, alongside
+# .../sft and .../smoke-test) rather than the container's ephemeral storage, for the same
+# reason sft-job.yaml's checkpoint is: it's the actual deliverable of this run.
+#
+# activeDeadlineSeconds below is a generous, UNVALIDATED guess (48h): unlike SFT, no real
+# GRPO run has been timed yet to calibrate against — RL rollout generation
+# (num_generations completions sampled per prompt, each up to max_completion_length
+# tokens) is typically much slower per-example than SFT's single forward/backward pass.
+# Tighten this once a real run's actual duration is known.
+#
+# Run:    kubectl apply -f configs/templates/training/grpo-real-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo -f
+# Checkpoint: /var/lib/fin-agent/checkpoints/grpo on the node afterward.
+# Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place):
+#   kubectl -n fin-agent delete job fin-agent-grpo
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-grpo
+  namespace: fin-agent
+spec:
+  backoffLimit: 0             # a training run that dies mid-way needs a human, not a silent retry
+  activeDeadlineSeconds: 172800  # 48h ceiling -- see header for why this is an unvalidated guess
+  template:
+    metadata:
+      labels: { app: fin-agent-grpo }
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: grpo
+          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as smoke-test-job.yaml — see its comment on why a recent tag matters
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir tox
+              cp /src/* /workspace/
+              mkdir -p /checkpoints/grpo
+              tox -e grpo -- train_grpo.py \
+                --base-model /checkpoints/sft \
+                --train-file /data/prepared/train.jsonl \
+                --output-dir /checkpoints/grpo \
+                --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --mlflow-experiment-name fin-agent-grpo
+              echo "--- checkpoint contents ---"
+              ls -la /checkpoints/grpo
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            # Starting point, matching sft-job.yaml's real-run sizing -- unvalidated for
+            # GRPO's own memory profile (rollout generation holds more in flight than
+            # SFT's teacher-forced forward pass); adjust once a real run's actual usage
+            # is known.
+            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi }
+            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi, nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            # Read-write: this job reads sft-job.yaml's checkpoint from .../sft/ and
+            # writes its own to .../grpo/, both under the same shared hostPath.
+            - { name: checkpoints, mountPath: /checkpoints }
+            - { name: dataset, mountPath: /data/prepared, readOnly: true }
+            # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
+            # comment for why this has to be a shared volume, not just an MLflow config
+            # flag, for mlflow.log_artifacts() (in train_grpo.py) to actually reach the
+            # MLflow server instead of silently writing to this pod's own filesystem.
+            - { name: mlflow-artifacts, mountPath: /data/artifacts }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-grpo-src }
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }
+        - name: checkpoints
+          hostPath: { path: /var/lib/fin-agent/checkpoints, type: DirectoryOrCreate }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }

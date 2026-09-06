@@ -84,7 +84,7 @@ spec:
                 --val-file /data/prepared/smoke_val.jsonl \
                 --output-dir /checkpoints/smoke-test \
                 --max-steps 10 \
-                --per-device-batch-size 32 --grad-accum 1 \
+                --per-device-batch-size 32 --grad-accum 1 --max-seq-length 8192 \
                 --eval-strategy steps --eval-steps 5 \
                 --save-strategy steps --save-steps 10 \
                 --logging-steps 1 \

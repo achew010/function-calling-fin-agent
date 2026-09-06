@@ -1,9 +1,9 @@
 # Smoke test for the GRPO pipeline (1_training/2_grpo/train_grpo.py): proves dataset
 # construction (reusing 2_evaluations/run_internal_eval.py's instance builder), the
 # reward function, rollout generation, the GRPO policy update, and checkpoint saving all
-# work end-to-end. Run before a real GRPO run, not alongside smoke-test-job.yaml or
-# anything in ../inference/ (which now also holds the BFCL benchmark job) — this
-# project targets a single GPU running one workload at a time.
+# work end-to-end. Run before grpo-real-job.yaml (the real run), not alongside
+# smoke-test-job.yaml or anything in ../inference/ (which now also holds the BFCL
+# benchmark job) — this project targets a single GPU running one workload at a time.
 #
 # --base-model points at smoke-test-job.yaml's own checkpoint (see that file — it saves a
 # merged, standalone model, not a bare LoRA adapter, to hostPath specifically so this job

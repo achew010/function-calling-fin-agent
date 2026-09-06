@@ -30,6 +30,7 @@ import argparse
 import contextlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -220,15 +221,37 @@ def main() -> None:
 
     with mlflow_run:
         trainer.train()
-        trainer.save_model(str(args.output_dir))
+        # Merge the LoRA adapter into the base weights and save a plain, full model --
+        # same reasoning as train_sft.py's identical step: --base-model here is already
+        # a merged SFT checkpoint (see that script), and GRPOTrainer's own peft_config
+        # wraps it in a *fresh* adapter for this stage, so trainer.model is a PeftModel
+        # again by the time training finishes. Leaving it unmerged would just move the
+        # same "adapter-only checkpoint, unusable as a standalone model" problem one
+        # stage downstream instead of fixing it.
+        merged_model = trainer.model.merge_and_unload()
+        merged_model.save_pretrained(str(args.output_dir))
+        # train_grpo.py has no separate tokenizer object (GRPOTrainer builds its own
+        # internally from --base-model) -- reload it here purely to save alongside the
+        # merged model, same as train_sft.py does with the one it already has in hand.
+        from transformers import AutoTokenizer
+
+        AutoTokenizer.from_pretrained(args.base_model).save_pretrained(str(args.output_dir))
+        # Trainer's own periodic checkpoints (output_dir/checkpoint-<step>/, adapter +
+        # optimizer/scheduler/rng state for resuming) are redundant now that the final
+        # state is already merged and saved above -- see train_sft.py's identical
+        # cleanup step for why leaving them in place is actively confusing, not just
+        # extra disk usage.
+        for checkpoint_dir in Path(args.output_dir).glob("checkpoint-*"):
+            if checkpoint_dir.is_dir():
+                shutil.rmtree(checkpoint_dir)
         if args.mlflow:
             # trainer.save_model() only writes to local disk -- MLflowCallback's own
             # artifact upload is gated behind the HF_MLFLOW_LOG_ARTIFACTS env var
             # (unset here) and only fires on the Trainer's own periodic checkpoint
-            # saves, never on this final save_model() call. Without this explicit
-            # upload, nothing reaches MLflow's Artifacts tab. GRPO has no held-out eval
-            # loop (unlike train_sft.py), so there's no "best" checkpoint to pick
-            # between -- this is just the one final trained state.
+            # saves, never on this final save call. Without this explicit upload,
+            # nothing reaches MLflow's Artifacts tab. GRPO has no held-out eval loop
+            # (unlike train_sft.py), so there's no "best" checkpoint to pick between --
+            # this is just the one final trained state.
             mlflow.log_artifacts(str(args.output_dir), artifact_path="model")
 
 

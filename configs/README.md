@@ -27,6 +27,7 @@ configs/
 | `templates/training/sft-job.yaml` | The real SFT run — full ToolACE-derived dataset, `train_sft.py`'s own defaults (3 epochs, epoch-based eval/save), checkpoint persisted to hostPath. |
 | `templates/training/grpo-job.yaml` | GRPO smoke test — dataset construction, reward function, rollout generation, and a checkpoint save. Warm-starts from `smoke-test-job.yaml`'s checkpoint, not the raw base model. |
 | `templates/training/run-grpo-smoke-chain.sh` | Runs dataset prep → SFT smoke test → GRPO smoke test in sequence, one command — exercises the SFT→GRPO checkpoint handoff end-to-end. |
+| `templates/training/grpo-real-job.yaml` | The real GRPO run — full dataset, `train_grpo.py`'s own defaults, warm-started from `sft-job.yaml`'s checkpoint (not the smoke one). Run `grpo-job.yaml` first to prove the pipeline works. |
 | `templates/inference/vllm-qwen3-8b.yaml` | vLLM serving the Qwen3-8B baseline — a standing Deployment, not a one-off Job. |
 | `templates/inference/bfcl-eval-job.yaml` | BFCL evaluation against the vLLM deployment above. **Depends on it being up** — use `run-bfcl-eval.sh`, not a bare `kubectl apply`, unless you're managing that dependency yourself. |
 | `templates/inference/run-bfcl-eval.sh` | Applies the vLLM deployment, waits for it to be Ready, then applies and follows the eval Job — the one-command way to run the benchmark without forgetting the server it needs. |
