@@ -94,8 +94,14 @@ spec:
             # post-merge weights even begins. Matching grpo-real-job.yaml's allocation
             # rather than guessing a smaller number, since that's already a proven
             # reference point in this codebase (same as sft-job.yaml's real-run sizing).
-            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 20Gi }
-            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
+            #
+            # ephemeral-storage bumped 20Gi->40Gi for the same reason, one limit later:
+            # after the memory fix let this job progress further, it got Evicted instead
+            # ("Pod ephemeral local storage usage exceeds the total limit of containers
+            # 20Gi") while writing the merged model's safetensors shards to disk -- also
+            # matching grpo-real-job.yaml's already-set value.
+            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi }
+            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi, nvidia.com/gpu: 1 }
           volumeMounts:
             - { name: src, mountPath: /src }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }
