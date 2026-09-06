@@ -111,9 +111,19 @@ class FunctionCallEvalCallback(TrainerCallback):
     Needs `self.trainer` set after Trainer construction (see main()): Trainer.evaluate()
     calls `self.log(output.metrics)` *before* dispatching `on_evaluate` to callbacks
     (verified against the installed transformers version's source — not assumed), so
-    mutating the `metrics` dict here would silently never reach any logger, MLflow
-    included. Calling `self.trainer.log(...)` directly triggers a fresh, correctly
-    dispatched log event instead.
+    mutating the `metrics` dict here would silently never reach any *logger* (MLflow
+    included) for this eval round — that already-fired self.log() call is what a logger
+    actually reacts to. Calling `self.trainer.log(...)` directly triggers a fresh,
+    correctly dispatched log event instead, which is why that's still done below.
+
+    Separately, and non-obviously, mutating `metrics` here IS still necessary for
+    `load_best_model_at_end`/`metric_for_best_model` to be able to use this value at
+    all: `_maybe_log_save_evaluate()` calls `self._determine_best_metric(metrics=...)`
+    using the exact dict object `evaluate()` returns, and that dict is the same object
+    passed into `on_evaluate` here (verified against source: `on_evaluate` runs, then
+    `evaluate()` returns that same `output.metrics` reference, before the outer loop
+    ever inspects it) — an in-place mutation here is visible to that later check, even
+    though a plain `self.trainer.log(...)` call is a separate, disconnected event.
     """
 
     def __init__(
@@ -157,8 +167,12 @@ class FunctionCallEvalCallback(TrainerCallback):
             model.train()
 
         fc_correctness = call_correctness(scored_examples)
-        if fc_correctness is not None:
-            self.trainer.log({"eval_fc_call_correctness": fc_correctness})
+        # Default to 0.0 (rather than leaving the key absent) when this round's sample
+        # happened to contain zero call-cases: metric_for_best_model="fc_call_correctness"
+        # (see main()) needs this key present on every eval round, or
+        # _determine_best_metric raises KeyError the first time it's missing.
+        metrics["eval_fc_call_correctness"] = fc_correctness if fc_correctness is not None else 0.0
+        self.trainer.log({"eval_fc_call_correctness": metrics["eval_fc_call_correctness"]})
 
 
 def main() -> None:
@@ -309,6 +323,17 @@ def main() -> None:
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
+        # Makes the final trainer.save_model() (and the mlflow.log_artifacts() upload
+        # after it, below) save/upload the best-scoring checkpoint by real generation-
+        # based call correctness, not just whatever the last step happened to produce —
+        # Trainer reloads state.best_model_checkpoint into self.model at the end of
+        # train() when this is set. Requires eval_strategy == save_strategy (and, for
+        # "steps", save_steps a multiple of eval_steps) — already true of both this
+        # script's own defaults (epoch/epoch) and the smoke test's overrides
+        # (steps/steps, 10 % 5 == 0); see TrainingArguments' own validation for why.
+        load_best_model_at_end=True,
+        metric_for_best_model="fc_call_correctness",
+        greater_is_better=True,
         bf16=True,
         dataset_text_field="text",
         report_to=[],
@@ -378,6 +403,15 @@ def main() -> None:
         trainer.train()
         trainer.save_model(str(args.output_dir))
         tokenizer.save_pretrained(str(args.output_dir))
+        if args.mlflow:
+            # The two save calls above only write to local disk. MLflowCallback does
+            # have its own artifact upload (on_save), but it's gated behind the
+            # HF_MLFLOW_LOG_ARTIFACTS env var (nothing here sets it) and only fires on
+            # the Trainer's own periodic checkpoint saves during training -- never on
+            # this final save_model() call, which isn't part of the Trainer's
+            # instrumented save path. Without this explicit upload, nothing ever
+            # reaches MLflow's Artifacts tab regardless of --save-strategy/--save-steps.
+            mlflow.log_artifacts(str(args.output_dir), artifact_path="model")
 
 
 if __name__ == "__main__":
