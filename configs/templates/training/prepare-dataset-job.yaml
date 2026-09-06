@@ -58,7 +58,7 @@ spec:
             - -c
             - |
               set -e
-              pip install --no-cache-dir datasets
+              pip install --no-cache-dir datasets scikit-learn
               cp /src/*.py /workspace/
               python3 prepare_dataset.py --output-dir /data/prepared
               head -20 /data/prepared/train.jsonl > /data/prepared/smoke_train.jsonl

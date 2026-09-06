@@ -27,6 +27,7 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 HAS_GPU=false
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -97,16 +98,51 @@ kubectl apply -f "${SCRIPT_DIR}/mlflow.yaml"
 kubectl -n fin-agent rollout status deploy/mlflow --timeout=180s
 kubectl config set-context --current --namespace=fin-agent
 
+# Every job manifest under templates/ mounts its code from a ConfigMap rather than a
+# custom image (see configs/README.md's design notes) — built here, once, from
+# PROJECT_ROOT, so `kubectl apply -f templates/...` just works afterward instead of
+# failing with FailedMount/ContainerCreating until someone remembers to build it by hand
+# (the exact failure mode that motivated adding this). --dry-run=client -o yaml |
+# kubectl apply -f - makes each one idempotent, so rerunning setup.sh (e.g. after
+# editing one of these .py files) safely updates the existing ConfigMap in place.
+echo ">> Building job source ConfigMaps"
+
+kubectl create configmap fin-agent-data-prep-src -n fin-agent \
+  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap fin-agent-sft-src -n fin-agent \
+  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
+  --from-file=run_internal_eval.py="${PROJECT_ROOT}/2_evaluations/run_internal_eval.py" \
+  --from-file=metrics.py="${PROJECT_ROOT}/1_training/1_sft/metrics.py" \
+  --from-file=train_sft.py="${PROJECT_ROOT}/1_training/1_sft/train_sft.py" \
+  --from-file=tox.ini="${PROJECT_ROOT}/tox.ini" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap fin-agent-grpo-src -n fin-agent \
+  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
+  --from-file=run_internal_eval.py="${PROJECT_ROOT}/2_evaluations/run_internal_eval.py" \
+  --from-file=train_grpo.py="${PROJECT_ROOT}/1_training/2_grpo/train_grpo.py" \
+  --from-file=tox.ini="${PROJECT_ROOT}/tox.ini" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap fin-agent-bfcl-src -n fin-agent \
+  --from-file=run_bfcl_eval.py="${PROJECT_ROOT}/2_evaluations/run_bfcl_eval.py" \
+  --from-file=log_bfcl_to_mlflow.py="${PROJECT_ROOT}/2_evaluations/log_bfcl_to_mlflow.py" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 echo ""
 echo "=============================================================="
-echo " Cluster ready."
+echo " Cluster ready. Job source ConfigMaps built:"
+echo "   fin-agent-data-prep-src, fin-agent-sft-src, fin-agent-grpo-src, fin-agent-bfcl-src"
 echo " MLflow (in-cluster, used by the job manifests):"
 echo "   http://mlflow.fin-agent.svc.cluster.local:5000"
 echo " MLflow (from this machine, for the UI):"
 echo "   kubectl -n fin-agent port-forward svc/mlflow 5000:5000"
 echo "   then open http://localhost:5000"
 echo ""
-echo " Next: build a job's source ConfigMap(s) and apply it — see each"
-echo " job manifest's header comment (smoke-test-job.yaml, bfcl-eval.yaml,"
-echo " grpo-job.yaml) or README.md."
+echo " Next: prepare the dataset once (everything else reads from it), then apply"
+echo " whichever job you want — see README.md:"
+echo "   kubectl apply -f ${SCRIPT_DIR}/../templates/training/prepare-dataset-job.yaml"
+echo "   kubectl wait --for=condition=complete job/fin-agent-prepare-dataset -n fin-agent --timeout=1800s"
 echo "=============================================================="
