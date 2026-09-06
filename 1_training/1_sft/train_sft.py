@@ -211,21 +211,30 @@ def main() -> None:
     parser.add_argument(
         "--per-device-batch-size",
         type=int,
-        default=4,
-        help="4 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
-        "small adapter) leaves an H100 with plenty of headroom at --max-seq-length "
-        "4096, so a larger per-device batch cuts wall-clock time without needing "
-        "more grad-accum steps to reach the same effective batch size.",
+        default=16,
+        help="16 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
+        "small adapter) leaves an H100 with plenty of headroom, so a larger "
+        "per-device batch cuts wall-clock time. Paired with --grad-accum 1 below "
+        "for an effective batch size of 16 with no accumulation.",
     )
     parser.add_argument(
         "--grad-accum",
         type=int,
-        default=4,
-        help="4 (not 8) by default, paired with the --per-device-batch-size bump "
-        "above to keep the effective batch size (16) the same while doing fewer, "
-        "larger forward/backward passes.",
+        default=1,
+        help="1 (not 8) by default — --per-device-batch-size above already reaches "
+        "the target effective batch size on its own; raise this instead of "
+        "--per-device-batch-size if 16 turns out to be too large for the GPU's memory.",
     )
-    parser.add_argument("--max-seq-length", type=int, default=4096)
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=8192,
+        help="8192 (not 4096) for headroom on longer conversations/tool schemas — "
+        "well within Qwen3-8B's native 40960 context. Verified against the real "
+        "training data (9515 examples): p99 ~2160 tokens, max ~4479 — 4096 was not "
+        "actually truncating meaningfully, so 8192 is comfortable margin over the "
+        "observed max, not a fix for an observed problem.",
+    )
     parser.add_argument(
         "--eval-strategy",
         default="epoch",

@@ -9,6 +9,12 @@
 # train_sft.py's own defaults (epoch-based, full dataset) are unchanged and are what the
 # real run uses. Only change these values here, never in train_sft.py itself.
 #
+# --per-device-batch-size is the one deliberate exception: it's set to match
+# train_sft.py's own real-run default (not minimized) so this smoke test doubles as an
+# early OOM check — if 16 @ --max-seq-length 8192 (also inherited from train_sft.py's
+# default, not overridden here) doesn't fit the GPU's memory, this 10-step run surfaces
+# that in minutes instead of hours into the real sft-job.yaml run.
+#
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
 #   2. prepare-dataset-job.yaml, run to completion first — this reads a 20/8-example
@@ -72,7 +78,7 @@ spec:
                 --val-file /data/prepared/smoke_val.jsonl \
                 --output-dir /workspace/checkpoints/smoke-test \
                 --max-steps 10 \
-                --per-device-batch-size 1 --grad-accum 1 \
+                --per-device-batch-size 16 --grad-accum 1 \
                 --eval-strategy steps --eval-steps 5 \
                 --save-strategy steps --save-steps 10 \
                 --logging-steps 1 \
