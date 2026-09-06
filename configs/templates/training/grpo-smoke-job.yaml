@@ -1,0 +1,131 @@
+# Smoke test for the GRPO pipeline (1_training/2_grpo/train_grpo.py): proves dataset
+# construction (reusing 2_evaluations/run_internal_eval.py's instance builder), the
+# reward function, rollout generation, the GRPO policy update, and checkpoint saving all
+# work end-to-end. Run before grpo-job.yaml (the real run), not alongside
+# sft-smoke-job.yaml or anything in ../inference/ (which now also holds the BFCL
+# benchmark job) — this project targets a single GPU running one workload at a time.
+#
+# --base-model points at sft-smoke-job.yaml's own checkpoint (see that file — it saves a
+# merged, standalone model, not a bare LoRA adapter, to hostPath specifically so this job
+# can chain off it), not the raw Qwen/Qwen3-8B base — RL needs a warm-started policy (see
+# 1_training/2_grpo/README.md for why: GRPO gets little useful reward signal from a
+# policy that rarely produces a valid completion to begin with). max-steps/
+# num-generations/tiny-data below are smoke-test-only overrides passed as explicit CLI
+# flags — train_grpo.py's own defaults are unchanged. Unlike the BFCL eval, no separate
+# vLLM server is needed: GRPOConfig's use_vllm defaults to False, so rollout generation
+# happens via the policy model's own .generate() in-process.
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
+#   2. prepare-dataset-job.yaml, run to completion first — this reads a 20-example slice
+#      (head of the real prepared train split) straight off the shared PVC it populates:
+#        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
+#   3. sft-smoke-job.yaml, run to completion first — this is the checkpoint --base-model
+#      below actually loads:
+#        kubectl apply -f configs/templates/training/sft-smoke-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-sft-smoke --timeout=1800s
+#
+# Build the source ConfigMap before applying (GRPO needs the same two upstream files SFT
+# does, since it reuses run_internal_eval.py's instance builder, which itself imports
+# prepare_dataset.py's call-syntax parser — plus tox.ini, reusing the same [testenv:grpo]
+# defined alongside SFT's; see tox.ini's header for why sitepackages=true matters here):
+#
+#   kubectl create configmap fin-agent-grpo-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
+#     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
+#     --from-file=tox.ini=tox.ini
+#
+# Run:    kubectl apply -f configs/templates/training/grpo-smoke-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo-smoke -f
+# Clean up (Jobs don't self-delete):
+#   kubectl -n fin-agent delete job fin-agent-grpo-smoke
+#   kubectl -n fin-agent delete configmap fin-agent-grpo-src
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-grpo-smoke
+  namespace: fin-agent
+spec:
+  backoffLimit: 0                  # a broken pipeline needs a human, not a silent retry
+  activeDeadlineSeconds: 1800      # 30 min ceiling
+  template:
+    metadata:
+      labels: { app: fin-agent-grpo-smoke }
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: grpo-smoke
+          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as sft-smoke-job.yaml — see its comment on why a recent tag matters
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir tox
+              cp /src/* /workspace/
+              tox -e grpo -- train_grpo.py \
+                --base-model /checkpoints/smoke-test \
+                --train-file /data/prepared/smoke_train.jsonl \
+                --output-dir /workspace/checkpoints/grpo-smoke \
+                --max-steps 6 \
+                --num-generations 2 --per-device-batch-size 2 \
+                --max-completion-length 64 \
+                --logging-steps 1 \
+                --save-strategy steps --save-steps 6 \
+                --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --mlflow-experiment-name fin-agent-grpo-smoke
+              echo "--- checkpoint contents (proves model saving worked) ---"
+              ls -la /workspace/checkpoints/grpo-smoke
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            # 32Gi (sft-smoke-job.yaml's own limit) OOMKilled a real run right at
+            # merge_and_unload()/save_pretrained() -- confirmed via Kubernetes' own
+            # OOMKilled pod status, not a CUDA OOM traceback, so this is container/system
+            # RAM, not GPU memory. GRPO's rollout generation (num_generations completions
+            # sampled in-process via model.generate(), plus their log-probs/advantages)
+            # holds more in memory during training than SFT's plain forward/backward
+            # pass, before the merge step's own need to briefly hold both pre- and
+            # post-merge weights even begins. Matching grpo-job.yaml's (the real run's)
+            # allocation rather than guessing a smaller number, since that's already a
+            # proven reference point in this codebase (same as sft-job.yaml's sizing).
+            #
+            # ephemeral-storage bumped 20Gi->40Gi for the same reason, one limit later:
+            # after the memory fix let this job progress further, it got Evicted instead
+            # ("Pod ephemeral local storage usage exceeds the total limit of containers
+            # 20Gi") while writing the merged model's safetensors shards to disk -- also
+            # matching grpo-job.yaml's already-set value.
+            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi }
+            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi, nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: dataset, mountPath: /data/prepared, readOnly: true }
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            # Read-only: this job consumes sft-smoke-job.yaml's checkpoint, never
+            # writes here itself (its own output goes to /workspace/checkpoints, still
+            # ephemeral -- nothing downstream chains off the GRPO smoke test's output).
+            - { name: checkpoints, mountPath: /checkpoints, readOnly: true }
+            # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
+            # comment for why this has to be a shared volume, not just an MLflow config
+            # flag, for mlflow.log_artifacts() (in train_grpo.py) to actually reach the
+            # MLflow server instead of silently writing to this pod's own filesystem.
+            - { name: mlflow-artifacts, mountPath: /data/artifacts }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-grpo-src }
+        - name: dataset
+          persistentVolumeClaim: { claimName: fin-agent-dataset }
+        # type: Directory (not DirectoryOrCreate): this path has to already exist, written
+        # by sft-smoke-job.yaml -- failing fast on a missing mount beats a confusing
+        # "no such file" from train_grpo.py's model loading if that prerequisite was skipped.
+        - name: checkpoints
+          hostPath: { path: /var/lib/fin-agent/checkpoints, type: Directory }
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

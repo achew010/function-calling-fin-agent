@@ -1,8 +1,9 @@
 # Smoke test for the SFT pipeline (1_training/1_sft/train_sft.py): proves data loading,
 # the training loop, the generation-based eval callback, and checkpoint saving all work
 # end-to-end, before trusting the real (hours-long, full-dataset) training run to the
-# same code. Run this before a real training run, not alongside anything in ../inference/ or
-# grpo-job.yaml — this project targets a single GPU running one workload at a time.
+# same code. Run this before sft-job.yaml (the real run), not alongside anything in
+# ../inference/ or grpo-smoke-job.yaml — this project targets a single GPU running one
+# workload at a time.
 #
 # Deliberately NOT a faithful preview of the real run's numbers: max-steps/eval-strategy/
 # eval-steps/tiny-data below are smoke-test-only overrides passed as explicit CLI flags —
@@ -39,31 +40,31 @@
 #
 # The checkpoint is written to hostPath (/var/lib/fin-agent/checkpoints/smoke-test,
 # distinct from sft-job.yaml's own .../checkpoints/sft) rather than the container's
-# ephemeral storage: grpo-job.yaml's own smoke test and a BFCL smoke eval both chain
-# off this checkpoint as their starting model, so it has to survive this pod exiting.
+# ephemeral storage: grpo-smoke-job.yaml and a BFCL smoke eval both chain off this
+# checkpoint as their starting model, so it has to survive this pod exiting.
 #
-# Run:    kubectl apply -f configs/templates/training/smoke-test-job.yaml
-# Logs:   kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
+# Run:    kubectl apply -f configs/templates/training/sft-smoke-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-sft-smoke -f
 # Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place since
-# grpo-job.yaml's smoke test and the BFCL smoke eval depend on it):
-#   kubectl -n fin-agent delete job fin-agent-sft-smoke-test
+# grpo-smoke-job.yaml and the BFCL smoke eval depend on it):
+#   kubectl -n fin-agent delete job fin-agent-sft-smoke
 #   kubectl -n fin-agent delete configmap fin-agent-sft-src
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fin-agent-sft-smoke-test
+  name: fin-agent-sft-smoke
   namespace: fin-agent
 spec:
   backoffLimit: 0                  # a broken pipeline needs a human, not a silent retry
   activeDeadlineSeconds: 1800      # 30 min ceiling — 10 steps + a tiny generation-based eval should be minutes, not that
   template:
     metadata:
-      labels: { app: fin-agent-smoke-test }
+      labels: { app: fin-agent-sft-smoke }
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
       containers:
-        - name: sft-smoke-test
+        - name: sft-smoke
           # A recent NVIDIA PyTorch NGC image with broad CUDA compute-capability support
           # (Ampere/Hopper and newer, incl. H100). An older tag can silently ship a torch
           # build that doesn't recognize a newer GPU's compute capability at all — hit
@@ -90,7 +91,7 @@ spec:
                 --logging-steps 1 \
                 --metrics-eval-samples 8 --metrics-max-new-tokens 256 \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
-                --mlflow-experiment-name fin-agent-sft-smoke-test
+                --mlflow-experiment-name fin-agent-sft-smoke
               echo "--- checkpoint contents (proves model saving worked) ---"
               ls -la /checkpoints/smoke-test
           env:

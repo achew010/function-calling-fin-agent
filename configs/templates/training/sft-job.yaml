@@ -1,15 +1,15 @@
 # The real SFT run (1_training/1_sft/train_sft.py) — full ToolACE-derived dataset,
 # train_sft.py's own defaults (3 epochs, LoRA bf16, epoch-based eval/save), not the
 # smoke test's 10-step/tiny-data overrides. --per-device-batch-size/--grad-accum/
-# --max-seq-length below are spelled out explicitly (matching smoke-test-job.yaml)
+# --max-seq-length below are spelled out explicitly (matching sft-smoke-job.yaml)
 # even though they're currently just train_sft.py's own defaults too, so the real
 # run's actual memory footprint is visible here rather than only in train_sft.py's
-# argparse help. Run smoke-test-job.yaml first to prove the pipeline works end-to-end
+# argparse help. Run sft-smoke-job.yaml first to prove the pipeline works end-to-end
 # before committing GPU hours to this one — it now uses the same batch size/sequence
 # length so it also serves as an early OOM check for this job specifically.
 #
-# Not alongside anything in ../inference/ or grpo-job.yaml — this project targets a
-# single GPU running one workload at a time.
+# Not alongside anything in ../inference/ or grpo-smoke-job.yaml/grpo-job.yaml — this
+# project targets a single GPU running one workload at a time.
 #
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
@@ -20,7 +20,7 @@
 #        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
 #        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
 #
-# This job's own source still reuses the same ConfigMap smoke-test-job.yaml builds
+# This job's own source still reuses the same ConfigMap sft-smoke-job.yaml builds
 # (including tox.ini — dependencies are installed via tox, sitepackages=true so it
 # layers onto the base image's GPU-matched torch instead of pip installing a fresh one
 # into an isolated venv; see tox.ini's header). prepare_dataset.py is still needed here
@@ -62,7 +62,7 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: sft
-          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as smoke-test-job.yaml — see its comment on why a recent tag matters
+          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as sft-smoke-job.yaml — see its comment on why a recent tag matters
           workingDir: /workspace
           command:
             - sh

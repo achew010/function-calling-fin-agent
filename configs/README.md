@@ -24,11 +24,12 @@ configs/
 | `setup/namespace.yaml` | The `fin-agent` namespace everything else lives in. |
 | `setup/mlflow.yaml` | Self-contained MLflow (ClusterIP + SQLite + hostPath) — a fresh instance for this VM, not tied to any external ingress hostname. |
 | `templates/training/prepare-dataset-job.yaml` | Runs `0_data/prepare_dataset.py` once, writing train/val/test.jsonl to a shared PVC (`fin-agent-dataset`). Run this before any other training job below — they all read from it. |
-| `templates/training/smoke-test-job.yaml` | SFT smoke test — 10 training steps, a step-based eval, and a checkpoint save. |
+| `templates/training/sft-smoke-job.yaml` | SFT smoke test — 10 training steps, a step-based eval, and a checkpoint save. |
 | `templates/training/sft-job.yaml` | The real SFT run — full ToolACE-derived dataset, `train_sft.py`'s own defaults (3 epochs, epoch-based eval/save), checkpoint persisted to hostPath. |
-| `templates/training/grpo-job.yaml` | GRPO smoke test — dataset construction, reward function, rollout generation, and a checkpoint save. Warm-starts from `smoke-test-job.yaml`'s checkpoint, not the raw base model. |
+| `templates/training/grpo-smoke-job.yaml` | GRPO smoke test — dataset construction, reward function, rollout generation, and a checkpoint save. Warm-starts from `sft-smoke-job.yaml`'s checkpoint, not the raw base model. |
 | `templates/training/run-grpo-smoke-chain.sh` | Runs dataset prep → SFT smoke test → GRPO smoke test in sequence, one command — exercises the SFT→GRPO checkpoint handoff end-to-end. |
-| `templates/training/grpo-real-job.yaml` | The real GRPO run — full dataset, `train_grpo.py`'s own defaults, warm-started from `sft-job.yaml`'s checkpoint (not the smoke one). Run `grpo-job.yaml` first to prove the pipeline works. |
+| `templates/training/grpo-job.yaml` | The real GRPO run — full dataset, `train_grpo.py`'s own defaults, warm-started from `sft-job.yaml`'s checkpoint (not the smoke one). Run `grpo-smoke-job.yaml` first to prove the pipeline works. |
+| `templates/training/run-sft-grpo-chain.sh` | Runs dataset prep → real SFT run → real GRPO run in sequence, one command — the same idea as `run-grpo-smoke-chain.sh`, applied to the two real (hours-to-days) runs. Run the smoke chain first. |
 | `templates/inference/vllm-qwen3-8b.yaml` | vLLM serving the Qwen3-8B baseline — a standing Deployment, not a one-off Job. |
 | `templates/inference/bfcl-eval-job.yaml` | BFCL evaluation against the vLLM deployment above. **Depends on it being up** — use `run-bfcl-eval.sh`, not a bare `kubectl apply`, unless you're managing that dependency yourself. |
 | `templates/inference/run-bfcl-eval.sh` | Applies the vLLM deployment, waits for it to be Ready, then applies and follows the eval Job — the one-command way to run the benchmark without forgetting the server it needs. |
@@ -54,8 +55,8 @@ kubectl create configmap fin-agent-sft-src -n fin-agent \
   --from-file=train_sft.py=1_training/1_sft/train_sft.py \
   --from-file=tox.ini=tox.ini
 
-kubectl apply -f configs/templates/training/smoke-test-job.yaml
-kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
+kubectl apply -f configs/templates/training/sft-smoke-job.yaml
+kubectl -n fin-agent logs -l app=fin-agent-sft-smoke -f
 ```
 
 Once the smoke test passes, the real run reuses the same `fin-agent-sft-src` ConfigMap
@@ -66,10 +67,13 @@ kubectl apply -f configs/templates/training/sft-job.yaml
 kubectl -n fin-agent logs -l app=fin-agent-sft -f
 ```
 
+Or run either chain (smoke or real) end-to-end in one command — see
+`templates/training/run-grpo-smoke-chain.sh` / `run-sft-grpo-chain.sh`.
+
 For the BFCL benchmark, build its ConfigMap (command in
 `templates/inference/bfcl-eval-job.yaml`'s header) then run
 `./templates/inference/run-bfcl-eval.sh` — it takes care of bringing up the vLLM
-deployment first. `templates/training/grpo-job.yaml` follows the same
+deployment first. `templates/training/grpo-smoke-job.yaml` follows the same
 ConfigMap-then-apply pattern as the SFT smoke test (and reads the same prepared-dataset
 PVC); see its own header.
 
@@ -89,10 +93,10 @@ PVC); see its own header.
 - **Dataset preparation is a job of its own, not baked into every training job.**
   ToolACE-derived train/val/test splits run well past the ~1MiB ConfigMap size limit, so
   `prepare-dataset-job.yaml` runs `0_data/prepare_dataset.py` once (deterministic,
-  seeded — reruns produce byte-identical splits) onto a shared PVC that
-  `smoke-test-job.yaml`, `sft-job.yaml`, and `grpo-job.yaml` all mount read-only. The
-  smoke-sized slices (`smoke_train.jsonl`, `smoke_val.jsonl`) are cut once there too,
-  rather than each smoke job re-slicing the full files on every run.
+  seeded — reruns produce byte-identical splits) onto a shared PVC that every training
+  job (`sft-smoke-job.yaml`, `sft-job.yaml`, `grpo-smoke-job.yaml`, `grpo-job.yaml`)
+  mounts read-only. The smoke-sized slices (`smoke_train.jsonl`, `smoke_val.jsonl`) are
+  cut once there too, rather than each smoke job re-slicing the full files on every run.
 - **No node labels, no hostname pinning.** Every `nodeSelector` that referenced a
   specific machine name was removed — Kubernetes schedules purely on the
   `nvidia.com/gpu` resource request, which is what makes this "usable anywhere" rather

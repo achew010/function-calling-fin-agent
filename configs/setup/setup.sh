@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # configs/setup.sh — bootstrap a barebones Linux VM (single GPU, e.g. 1xH100) into a
 # single-node k3s cluster capable of running this project's Kubernetes jobs
-# (smoke-test-job.yaml, bfcl-eval.yaml, grpo-job.yaml). Run ON that VM.
+# (sft-smoke-job.yaml, sft-job.yaml, grpo-smoke-job.yaml, grpo-job.yaml,
+# bfcl-eval-job.yaml). Run ON that VM.
 #
 # What this does:
 #   1. If an NVIDIA GPU is present (`nvidia-smi` works): installs nvidia-container-toolkit

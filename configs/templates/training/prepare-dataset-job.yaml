@@ -1,12 +1,13 @@
 # One-shot dataset preparation: downloads Team-ACE/ToolACE from the HF Hub and writes
-# train/val/test.jsonl (0_data/prepare_dataset.py) to a PVC that smoke-test-job.yaml,
-# sft-job.yaml, and grpo-job.yaml all mount read-only afterward. A single source of
-# prepared data instead of each training job re-running prepare_dataset.py itself, or the
-# user hand-building per-job data ConfigMaps from a local run of it.
+# train/val/test.jsonl (0_data/prepare_dataset.py) to a PVC that every training job in
+# this directory (sft-smoke-job.yaml, sft-job.yaml, grpo-smoke-job.yaml, grpo-job.yaml)
+# mounts read-only afterward. A single source of prepared data instead of each training
+# job re-running prepare_dataset.py itself, or the user hand-building per-job data
+# ConfigMaps from a local run of it.
 #
 # Also slices the smoke-test-sized samples (smoke_train.jsonl, smoke_val.jsonl) here,
 # once, rather than each smoke job re-slicing the full train/val files itself on every
-# run — smoke-test-job.yaml and grpo-job.yaml both just read smoke_train.jsonl directly.
+# run — sft-smoke-job.yaml and grpo-smoke-job.yaml both just read smoke_train.jsonl directly.
 #
 # Prerequisite: run setup/setup.sh first (creates the namespace this lives in).
 #

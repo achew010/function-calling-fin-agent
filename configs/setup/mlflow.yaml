@@ -22,9 +22,9 @@
 # filesystem instead of proxying the upload over HTTP to this server. Those writes
 # silently land nowhere useful and vanish with the pod — no error, no artifacts, ever.
 # Mounting this same PVC into both this Deployment and every training job that logs a
-# model (see smoke-test-job.yaml, sft-job.yaml, grpo-job.yaml) at the identical
-# container path (/data/artifacts) sidesteps the proxy-scheme question entirely: both
-# sides are just reading/writing the same underlying directory directly.
+# model (see sft-smoke-job.yaml, sft-job.yaml, grpo-smoke-job.yaml, grpo-job.yaml) at the
+# identical container path (/data/artifacts) sidesteps the proxy-scheme question
+# entirely: both sides are just reading/writing the same underlying directory directly.
 apiVersion: v1
 kind: PersistentVolume
 metadata:

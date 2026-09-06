@@ -32,9 +32,9 @@ if [ "${FULL_SCALE:-0}" = "1" ]; then
 fi
 
 # Names double as the hostPath subdirectory under /var/lib/fin-agent/checkpoints:
-#   smoke-test -> ../training/smoke-test-job.yaml (job fin-agent-sft-smoke-test)
+#   smoke-test -> ../training/sft-smoke-job.yaml (job fin-agent-sft-smoke)
 #   sft        -> ../training/sft-job.yaml (job fin-agent-sft)
-#   grpo       -> ../training/grpo-real-job.yaml (job fin-agent-grpo)
+#   grpo       -> ../training/grpo-job.yaml (job fin-agent-grpo)
 # A plain array (not an associative one) so this only needs bash 3.2+, not bash 4 --
 # unverified which the target VM ships. Local, single-node filesystem checks below (this
 # script runs ON the same VM the checkpoints live on, same as setup.sh) skip whichever
