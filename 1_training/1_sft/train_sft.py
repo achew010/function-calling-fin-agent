@@ -226,7 +226,12 @@ def main() -> None:
         default=0.03,
         help="Fraction of total steps to linearly warm up the LR over, before the "
         "scheduler's normal decay — without it, training starts at the full "
-        "--lr (2e-4 by default) from step 1, a known source of early instability.",
+        "--lr (2e-4 by default) from step 1, a known source of early instability. "
+        "Passed as SFTConfig's warmup_steps below, not warmup_ratio: transformers "
+        "removed warmup_ratio entirely as of the 5.x line, consolidating it into "
+        "warmup_steps (an int is exact steps, a float in [0, 1) is a ratio of total "
+        "steps — verified against the installed transformers version's source, not "
+        "assumed). CLI flag name kept as --warmup-ratio for stability.",
     )
     parser.add_argument(
         "--per-device-batch-size",
@@ -322,7 +327,7 @@ def main() -> None:
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_ratio,  # see --warmup-ratio's help above for why this isn't warmup_ratio
         max_length=args.max_seq_length,  # trl renamed SFTConfig's max_seq_length -> max_length in newer releases; CLI flag name kept for stability
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
