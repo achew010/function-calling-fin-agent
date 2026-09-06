@@ -5,15 +5,15 @@
 # anything in ../inference/ (which now also holds the BFCL benchmark job) — this
 # project targets a single GPU running one workload at a time.
 #
-# Deliberately NOT a faithful preview of real GRPO training: --base-model is the raw
-# Qwen/Qwen3-8B here, not an SFT checkpoint (smoke-test-job.yaml's checkpoint isn't
-# persisted anywhere durable — it lives in that job's ephemeral container). A real GRPO
-# run should point --base-model at a real SFT checkpoint (see 1_training/2_grpo/README.md
-# for why RL needs a warm-started policy). max-steps/num-generations/tiny-data below are
-# smoke-test-only overrides passed as explicit CLI flags — train_grpo.py's own defaults
-# are unchanged. Unlike the BFCL eval, no separate vLLM server is needed: GRPOConfig's
-# use_vllm defaults to False, so rollout generation happens via the policy model's own
-# .generate() in-process.
+# --base-model points at smoke-test-job.yaml's own checkpoint (see that file — it saves a
+# merged, standalone model, not a bare LoRA adapter, to hostPath specifically so this job
+# can chain off it), not the raw Qwen/Qwen3-8B base — RL needs a warm-started policy (see
+# 1_training/2_grpo/README.md for why: GRPO gets little useful reward signal from a
+# policy that rarely produces a valid completion to begin with). max-steps/
+# num-generations/tiny-data below are smoke-test-only overrides passed as explicit CLI
+# flags — train_grpo.py's own defaults are unchanged. Unlike the BFCL eval, no separate
+# vLLM server is needed: GRPOConfig's use_vllm defaults to False, so rollout generation
+# happens via the policy model's own .generate() in-process.
 #
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
@@ -21,6 +21,10 @@
 #      (head of the real prepared train split) straight off the shared PVC it populates:
 #        kubectl apply -f configs/templates/training/prepare-dataset-job.yaml
 #        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-prepare-dataset --timeout=1800s
+#   3. smoke-test-job.yaml, run to completion first — this is the checkpoint --base-model
+#      below actually loads:
+#        kubectl apply -f configs/templates/training/smoke-test-job.yaml
+#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-sft-smoke-test --timeout=1800s
 #
 # Build the source ConfigMap before applying (GRPO needs the same two upstream files SFT
 # does, since it reuses run_internal_eval.py's instance builder, which itself imports
@@ -64,7 +68,7 @@ spec:
               pip install --no-cache-dir tox
               cp /src/* /workspace/
               tox -e grpo -- train_grpo.py \
-                --base-model Qwen/Qwen3-8B \
+                --base-model /checkpoints/smoke-test \
                 --train-file /data/prepared/smoke_train.jsonl \
                 --output-dir /workspace/checkpoints/grpo-smoke-test \
                 --max-steps 6 \
@@ -86,6 +90,10 @@ spec:
             - { name: src, mountPath: /src }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            # Read-only: this job consumes smoke-test-job.yaml's checkpoint, never
+            # writes here itself (its own output goes to /workspace/checkpoints, still
+            # ephemeral -- nothing downstream chains off the GRPO smoke test's output).
+            - { name: checkpoints, mountPath: /checkpoints, readOnly: true }
             # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
             # comment for why this has to be a shared volume, not just an MLflow config
             # flag, for mlflow.log_artifacts() (in train_grpo.py) to actually reach the
@@ -96,6 +104,11 @@ spec:
           configMap: { name: fin-agent-grpo-src }
         - name: dataset
           persistentVolumeClaim: { claimName: fin-agent-dataset }
+        # type: Directory (not DirectoryOrCreate): this path has to already exist, written
+        # by smoke-test-job.yaml -- failing fast on a missing mount beats a confusing
+        # "no such file" from train_grpo.py's model loading if that prerequisite was skipped.
+        - name: checkpoints
+          hostPath: { path: /var/lib/fin-agent/checkpoints, type: Directory }
         - name: mlflow-artifacts
           persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
         - name: hf-cache

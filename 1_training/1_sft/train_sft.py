@@ -12,12 +12,18 @@ the chat template renders assistant turns with an *empty* think block
 a bug: it's what teaches the model to reproduce the same immediate-answer, non-thinking
 pattern used at inference (see the enable_thinking=False notes in 2_evaluations/).
 
+Saves a merged, standalone model to --output-dir (LoRA folded into the base weights via
+merge_and_unload(), not an adapter-only checkpoint) — see main()'s comment at the save
+step for why: every downstream consumer (train_grpo.py, run_bfcl_eval.py) loads
+checkpoints the same way it loads the raw Qwen/Qwen3-8B baseline, no adapter-aware
+loading path needed anywhere else.
+
 Usage:
     python train_sft.py \
         --base-model Qwen/Qwen3-8B \
         --train-file ../../0_data/data/train.jsonl \
         --val-file ../../0_data/data/val.jsonl \
-        --output-dir checkpoints/adapter-general
+        --output-dir checkpoints/sft-general
 """
 
 from __future__ import annotations
@@ -401,7 +407,19 @@ def main() -> None:
 
     with mlflow_run:
         trainer.train()
-        trainer.save_model(str(args.output_dir))
+        # Merge the LoRA adapter into the base weights and save a plain, full model —
+        # not trainer.save_model()'s adapter-only output (adapter_config.json +
+        # adapter_model.safetensors, no usable standalone model). Downstream consumers
+        # (train_grpo.py's --base-model, run_bfcl_eval.py's --local-model-path) both
+        # expect something loadable directly via AutoModelForCausalLM.from_pretrained,
+        # not a PEFT adapter needing its own base model resolved separately — merging
+        # here means every consumer of this checkpoint uses the exact same loading path
+        # as the plain Qwen/Qwen3-8B baseline, adapter-awareness included nowhere else.
+        # Not supported for --use-qlora (merging LoRA into a 4-bit-quantized base is a
+        # known PEFT limitation — dequantizing first is a separate, unimplemented step);
+        # only matters if that flag is ever turned on, off by default.
+        merged_model = trainer.model.merge_and_unload()
+        merged_model.save_pretrained(str(args.output_dir))
         tokenizer.save_pretrained(str(args.output_dir))
         if args.mlflow:
             # The two save calls above only write to local disk. MLflowCallback does

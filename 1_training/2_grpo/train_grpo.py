@@ -19,7 +19,7 @@ the exact same instances the internal eval scores checkpoints against.
 
 Usage:
     python train_grpo.py \
-        --base-model ../1_sft/checkpoints/adapter-general \
+        --base-model ../1_sft/checkpoints/sft-general \
         --train-file ../../0_data/data/train.jsonl \
         --output-dir checkpoints/grpo-general
 """
@@ -112,7 +112,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--base-model",
-        default="../1_sft/checkpoints/adapter-general",
+        default="../1_sft/checkpoints/sft-general",
         help="Starting policy — the SFT checkpoint from ../1_sft/, not the raw base model (see module docstring).",
     )
     parser.add_argument("--train-file", type=Path, required=True)

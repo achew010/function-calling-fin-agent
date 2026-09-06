@@ -37,9 +37,15 @@
 #     --from-file=train_sft.py=1_training/1_sft/train_sft.py \
 #     --from-file=tox.ini=tox.ini
 #
+# The checkpoint is written to hostPath (/var/lib/fin-agent/checkpoints/smoke-test,
+# distinct from sft-job.yaml's own .../checkpoints/sft) rather than the container's
+# ephemeral storage: grpo-job.yaml's own smoke test and a BFCL smoke eval both chain
+# off this checkpoint as their starting model, so it has to survive this pod exiting.
+#
 # Run:    kubectl apply -f configs/templates/training/smoke-test-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
-# Clean up (Jobs don't self-delete):
+# Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place since
+# grpo-job.yaml's smoke test and the BFCL smoke eval depend on it):
 #   kubectl -n fin-agent delete job fin-agent-sft-smoke-test
 #   kubectl -n fin-agent delete configmap fin-agent-sft-src
 apiVersion: batch/v1
@@ -76,7 +82,7 @@ spec:
                 --base-model Qwen/Qwen3-8B \
                 --train-file /data/prepared/smoke_train.jsonl \
                 --val-file /data/prepared/smoke_val.jsonl \
-                --output-dir /workspace/checkpoints/smoke-test \
+                --output-dir /checkpoints/smoke-test \
                 --max-steps 10 \
                 --per-device-batch-size 16 --grad-accum 1 \
                 --eval-strategy steps --eval-steps 5 \
@@ -86,7 +92,7 @@ spec:
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-sft-smoke-test
               echo "--- checkpoint contents (proves model saving worked) ---"
-              ls -la /workspace/checkpoints/smoke-test
+              ls -la /checkpoints/smoke-test
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
@@ -97,6 +103,7 @@ spec:
             - { name: src, mountPath: /src }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            - { name: checkpoints, mountPath: /checkpoints }
             # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
             # comment for why this has to be a shared volume, not just an MLflow config
             # flag, for mlflow.log_artifacts() (in train_sft.py) to actually reach the
@@ -107,6 +114,8 @@ spec:
           configMap: { name: fin-agent-sft-src }
         - name: dataset
           persistentVolumeClaim: { claimName: fin-agent-dataset }
+        - name: checkpoints
+          hostPath: { path: /var/lib/fin-agent/checkpoints, type: DirectoryOrCreate }
         - name: mlflow-artifacts
           persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
         - name: hf-cache

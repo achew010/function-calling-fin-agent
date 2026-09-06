@@ -12,12 +12,13 @@ Default model: Qwen/Qwen3-8B — confirmed via `bfcl models` / MODEL_CONFIG_MAPP
 prompting-based fine-tuning approach (tools embedded as text in the system message,
 calls parsed out of generated text) — NOT the "-FC" variant, which drives the model's
 native tool-calling API format instead. This should be the SAME base checkpoint
-1_training/train_lora.py fine-tunes, so a baseline-vs-fine-tuned comparison isolates the
-effect of fine-tuning rather than confounding it with a different base model.
+1_training/1_sft/train_sft.py fine-tunes, so a baseline-vs-fine-tuned comparison isolates
+the effect of fine-tuning rather than confounding it with a different base model.
 
-To evaluate a fine-tuned checkpoint: merge the LoRA adapter into the base weights (see
-1_training/README.md) and pass local_model_path pointing at the merged directory,
-keeping model="Qwen/Qwen3-8B" (same architecture/tokenizer/handler).
+To evaluate a fine-tuned checkpoint: pass local_model_path pointing at train_sft.py's
+--output-dir directly, keeping model="Qwen/Qwen3-8B" (same architecture/tokenizer/
+handler). No separate merge step needed — train_sft.py already saves a merged, standalone
+model (not a bare LoRA adapter), loadable the same way as the raw HF baseline.
 
 Usage:
     python run_bfcl_eval.py --model Qwen/Qwen3-8B --test-category python --num-gpus 1
