@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -181,7 +182,15 @@ def main() -> None:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument(
-        "--target-modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"]
+        "--target-modules",
+        nargs="+",
+        default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        help=(
+            "Attention-only (q/k/v/o_proj) is a common but underpowered default for a "
+            "task like this: teaching the model a new *output format* (JSON call "
+            "schema instead of ToolACE's native syntax) leans heavily on the MLP "
+            "blocks, so gate/up/down_proj are included by default too."
+        ),
     )
     parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument(
@@ -191,8 +200,31 @@ def main() -> None:
         help="Overrides --epochs when > 0 — e.g. for a smoke run of a fixed number of steps regardless of dataset size.",
     )
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--per-device-batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.03,
+        help="Fraction of total steps to linearly warm up the LR over, before the "
+        "scheduler's normal decay — without it, training starts at the full "
+        "--lr (2e-4 by default) from step 1, a known source of early instability.",
+    )
+    parser.add_argument(
+        "--per-device-batch-size",
+        type=int,
+        default=4,
+        help="4 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
+        "small adapter) leaves an H100 with plenty of headroom at --max-seq-length "
+        "4096, so a larger per-device batch cuts wall-clock time without needing "
+        "more grad-accum steps to reach the same effective batch size.",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=4,
+        help="4 (not 8) by default, paired with the --per-device-batch-size bump "
+        "above to keep the effective batch size (16) the same while doing fewer, "
+        "larger forward/backward passes.",
+    )
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument(
         "--eval-strategy",
@@ -261,6 +293,7 @@ def main() -> None:
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.grad_accum,
+        warmup_ratio=args.warmup_ratio,
         max_length=args.max_seq_length,  # trl renamed SFTConfig's max_seq_length -> max_length in newer releases; CLI flag name kept for stability
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
@@ -288,18 +321,54 @@ def main() -> None:
     )
     fc_callback.trainer = trainer  # see FunctionCallEvalCallback docstring for why
 
+    mlflow_run = contextlib.nullcontext()
     if args.mlflow:
+        import mlflow
         from transformers.integrations import MLflowCallback
 
         if args.mlflow_tracking_uri:
             os.environ["MLFLOW_TRACKING_URI"] = args.mlflow_tracking_uri
         if args.mlflow_experiment_name:
             os.environ["MLFLOW_EXPERIMENT_NAME"] = args.mlflow_experiment_name
+
+        # MLflowCallback (added below) auto-logs TrainingArguments + model.config, but
+        # model.config on a PeftModel is a passthrough to the *frozen base model's*
+        # config (verified against peft's source) -- it never sees the LoraConfig, which
+        # PEFT keeps on a separate `peft_config` attribute. MLflowCallback.setup() only
+        # calls mlflow.start_run() when no run is already active (verified against
+        # transformers' source), so starting the run here first and logging the LoRA
+        # hyperparameters onto it is the only way they end up in MLflow at all -- without
+        # this, a run would show every TrainingArguments field but not r/alpha/dropout/
+        # target_modules, the exact values that actually define what got fine-tuned.
+        #
+        # Also why this is `with mlflow_run:` below rather than a bare start_run() call:
+        # MLflowCallback only auto-ends a run it started itself (_auto_end_run, set in
+        # its setup() only on the branch that calls start_run() -- verified against its
+        # source). Since this run is started here instead, on_train_end() never ends
+        # it, and it would sit "RUNNING" in the MLflow UI forever after the process
+        # exits. mlflow.start_run()'s return value is itself a context manager that
+        # ends the run (FINISHED, or FAILED on an exception) on __exit__.
+        if args.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+        if args.mlflow_experiment_name:
+            mlflow.set_experiment(args.mlflow_experiment_name)
+        mlflow_run = mlflow.start_run()
+        mlflow.log_params(
+            {
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "lora_target_modules": ",".join(args.target_modules),
+                "use_qlora": args.use_qlora,
+            }
+        )
+
         trainer.add_callback(MLflowCallback())
 
-    trainer.train()
-    trainer.save_model(str(args.output_dir))
-    tokenizer.save_pretrained(str(args.output_dir))
+    with mlflow_run:
+        trainer.train()
+        trainer.save_model(str(args.output_dir))
+        tokenizer.save_pretrained(str(args.output_dir))
 
 
 if __name__ == "__main__":
