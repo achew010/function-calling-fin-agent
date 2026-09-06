@@ -4,6 +4,52 @@
 # (mlflow.fin-agent.svc.cluster.local:5000), and for human/UI access from outside
 # the cluster, port-forward:
 #   kubectl -n fin-agent port-forward svc/mlflow 5000:5000
+#
+# fin-agent-mlflow-artifacts-pv/pvc below is a *statically provisioned* PV/PVC pair —
+# a hostPath backing it directly (at /var/lib/fin-agent/mlflow-artifacts on this VM's
+# own disk) rather than the cluster's default `local-path` dynamic provisioner, which
+# would pick an opaque, unpredictable directory under its own management path instead.
+# A distinct storageClassName on both the PV and this PVC makes them bind to each other
+# specifically, bypassing dynamic provisioning entirely.
+#
+# Why this exists at all: MLflow's server was passing --default-artifact-root as a bare
+# local path (/data/artifacts), which (verified against mlflow's own
+# resolve_default_artifact_root() source) only gets upgraded to the HTTP-proxied
+# mlflow-artifacts:/ scheme when --default-artifact-root is left unset — with it set
+# explicitly, new experiments' artifact_uri stays a bare local path, so a training job's
+# MLflow client (running in a completely different pod) resolves that to a
+# LocalArtifactRepository and tries to write directly to ITS OWN container's
+# filesystem instead of proxying the upload over HTTP to this server. Those writes
+# silently land nowhere useful and vanish with the pod — no error, no artifacts, ever.
+# Mounting this same PVC into both this Deployment and every training job that logs a
+# model (see smoke-test-job.yaml, sft-job.yaml, grpo-job.yaml) at the identical
+# container path (/data/artifacts) sidesteps the proxy-scheme question entirely: both
+# sides are just reading/writing the same underlying directory directly.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fin-agent-mlflow-artifacts-pv
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fin-agent-mlflow-artifacts
+  hostPath:
+    path: /var/lib/fin-agent/mlflow-artifacts
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fin-agent-mlflow-artifacts
+  namespace: fin-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: fin-agent-mlflow-artifacts
+  resources:
+    requests: { storage: 20Gi }
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -65,11 +111,14 @@ spec:
             periodSeconds: 10
           volumeMounts:
             - { name: data, mountPath: /data }
+            - { name: artifacts, mountPath: /data/artifacts }
       volumes:
         - name: data
           hostPath:
             path: /var/lib/fin-agent/mlflow
             type: DirectoryOrCreate
+        - name: artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
 ---
 apiVersion: v1
 kind: Service

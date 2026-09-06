@@ -86,10 +86,17 @@ spec:
             - { name: src, mountPath: /src }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
+            # comment for why this has to be a shared volume, not just an MLflow config
+            # flag, for mlflow.log_artifacts() (in train_grpo.py) to actually reach the
+            # MLflow server instead of silently writing to this pod's own filesystem.
+            - { name: mlflow-artifacts, mountPath: /data/artifacts }
       volumes:
         - name: src
           configMap: { name: fin-agent-grpo-src }
         - name: dataset
           persistentVolumeClaim: { claimName: fin-agent-dataset }
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
         - name: hf-cache
           hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

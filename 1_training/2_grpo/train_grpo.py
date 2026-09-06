@@ -27,7 +27,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -184,19 +186,50 @@ def main() -> None:
         peft_config=lora_config,
     )
 
+    mlflow_run = contextlib.nullcontext()
     if args.mlflow:
-        import os
-
+        import mlflow
         from transformers.integrations import MLflowCallback
 
         if args.mlflow_tracking_uri:
             os.environ["MLFLOW_TRACKING_URI"] = args.mlflow_tracking_uri
         if args.mlflow_experiment_name:
             os.environ["MLFLOW_EXPERIMENT_NAME"] = args.mlflow_experiment_name
+
+        # `with mlflow_run:` below (not a bare start_run() call) because MLflowCallback
+        # only auto-ends a run it started itself -- since we start it here instead (so
+        # LoRA hyperparameters can be logged, matching train_sft.py's same reasoning),
+        # its on_train_end() never ends it, and it would sit "RUNNING" in the MLflow UI
+        # forever after the process exits. See train_sft.py's own version of this same
+        # fix for the fuller explanation, verified against transformers'/mlflow's source.
+        if args.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+        if args.mlflow_experiment_name:
+            mlflow.set_experiment(args.mlflow_experiment_name)
+        mlflow_run = mlflow.start_run()
+        mlflow.log_params(
+            {
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "kl_beta": args.kl_beta,
+                "num_generations": args.num_generations,
+            }
+        )
+
         trainer.add_callback(MLflowCallback())
 
-    trainer.train()
-    trainer.save_model(str(args.output_dir))
+    with mlflow_run:
+        trainer.train()
+        trainer.save_model(str(args.output_dir))
+        if args.mlflow:
+            # trainer.save_model() only writes to local disk -- MLflowCallback's own
+            # artifact upload is gated behind the HF_MLFLOW_LOG_ARTIFACTS env var
+            # (unset here) and only fires on the Trainer's own periodic checkpoint
+            # saves, never on this final save_model() call. Without this explicit
+            # upload, nothing reaches MLflow's Artifacts tab. GRPO has no held-out eval
+            # loop (unlike train_sft.py), so there's no "best" checkpoint to pick
+            # between -- this is just the one final trained state.
+            mlflow.log_artifacts(str(args.output_dir), artifact_path="model")
 
 
 if __name__ == "__main__":

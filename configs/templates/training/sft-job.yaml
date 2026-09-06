@@ -93,6 +93,11 @@ spec:
             - { name: hf-cache, mountPath: /root/.cache/huggingface }
             - { name: checkpoints, mountPath: /checkpoints }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }
+            # Same PVC + path setup/mlflow.yaml's Deployment mounts -- see its header
+            # comment for why this has to be a shared volume, not just an MLflow config
+            # flag, for mlflow.log_artifacts() (in train_sft.py) to actually reach the
+            # MLflow server instead of silently writing to this pod's own filesystem.
+            - { name: mlflow-artifacts, mountPath: /data/artifacts }
       volumes:
         - name: src
           configMap: { name: fin-agent-sft-src }
@@ -102,3 +107,5 @@ spec:
           hostPath: { path: /var/lib/fin-agent/checkpoints, type: DirectoryOrCreate }
         - name: dataset
           persistentVolumeClaim: { claimName: fin-agent-dataset }
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
