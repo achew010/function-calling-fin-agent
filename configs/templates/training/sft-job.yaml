@@ -1,0 +1,89 @@
+# The real SFT run (1_training/1_sft/train_sft.py) — full ToolACE-derived dataset,
+# train_sft.py's own defaults (3 epochs, LoRA bf16, epoch-based eval/save), not the
+# smoke test's 10-step/tiny-data overrides. Run smoke-test-job.yaml first to prove the
+# pipeline works end-to-end before committing GPU hours to this one.
+#
+# Not alongside anything in ../inference/ or grpo-job.yaml — this project targets a
+# single GPU running one workload at a time.
+#
+# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+#
+# Unlike the smoke test, this job doesn't need a data ConfigMap: ToolACE's full
+# train/val/test splits run well past the ~1MiB ConfigMap size limit, so this runs
+# 0_data/prepare_dataset.py itself at pod start (deterministic, seeded — same splits
+# every time) rather than trying to ship prepared data in. It does reuse the same source
+# ConfigMap smoke-test-job.yaml builds:
+#
+#   kubectl create configmap fin-agent-sft-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
+#     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=metrics.py=1_training/1_sft/metrics.py \
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py
+#
+# The checkpoint is written to hostPath (like hf-cache and mlflow's own data elsewhere in
+# this project) rather than the container's ephemeral storage, since it's the actual
+# deliverable of this run and has to survive the pod — unlike the smoke test, where the
+# checkpoint only exists to prove `trainer.save_model()` doesn't crash.
+#
+# Run:    kubectl apply -f configs/templates/training/sft-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-sft -f
+# Progress: MLflow (port-forward per setup/mlflow.yaml's header) — logging-steps below
+#           and train_sft.py's FunctionCallEvalCallback report loss/eval metrics per step.
+# Checkpoint: /var/lib/fin-agent/checkpoints/sft on the node afterward.
+# Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place):
+#   kubectl -n fin-agent delete job fin-agent-sft
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-sft
+  namespace: fin-agent
+spec:
+  backoffLimit: 0             # a training run that dies mid-way needs a human, not a silent retry
+  activeDeadlineSeconds: 86400  # 24h ceiling — 3 epochs over the full dataset on 1 GPU is hours, not minutes, but not unbounded either
+  template:
+    metadata:
+      labels: { app: fin-agent-sft }
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: sft
+          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as smoke-test-job.yaml — see its comment on why a recent tag matters
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
+                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
+                "jinja2>=3.1.0" mlflow
+              cp /src/*.py /workspace/
+              mkdir -p /workspace/data /checkpoints/sft
+              python3 prepare_dataset.py --output-dir /workspace/data
+              python3 train_sft.py \
+                --base-model Qwen/Qwen3-8B \
+                --train-file /workspace/data/train.jsonl \
+                --val-file /workspace/data/val.jsonl \
+                --output-dir /checkpoints/sft \
+                --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --mlflow-experiment-name fin-agent-sft
+              echo "--- checkpoint contents ---"
+              ls -la /checkpoints/sft
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi }
+            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi, nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            - { name: checkpoints, mountPath: /checkpoints }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-sft-src }
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }
+        - name: checkpoints
+          hostPath: { path: /var/lib/fin-agent/checkpoints, type: DirectoryOrCreate }

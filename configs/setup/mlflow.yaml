@@ -1,0 +1,83 @@
+# Self-contained MLflow tracking server for this project's jobs — a fresh instance for
+# this VM, not the specific home-lab instance this project was originally developed
+# against. ClusterIP only (no Ingress): job manifests here reach it via in-cluster DNS
+# (mlflow.fin-agent.svc.cluster.local:5000), and for human/UI access from outside
+# the cluster, port-forward:
+#   kubectl -n fin-agent port-forward svc/mlflow 5000:5000
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-config
+  namespace: fin-agent
+data:
+  MLFLOW_ARTIFACT_ROOT: /data/artifacts
+  MLFLOW_SQLSTORE_URI: sqlite:////data/mlflow.db
+  HOST: "0.0.0.0"
+  PORT: "5000"
+  # Wildcarded rather than pinned to a specific hostname/IP: this config is meant to run
+  # on an arbitrary VM, so there's no fixed ingress hostname or ClusterIP to allowlist
+  # ahead of time. mlflow's Host-header and CORS checks default to accepting only
+  # localhost + bare private IPs, which 403s the in-cluster DNS name jobs actually use —
+  # hit this for real building this project's original (non-portable) manifests:
+  # "Invalid Host header - possible DNS rebinding attack detected" on the Host check, and
+  # a separate "Blocked cross-origin request" from the UI's own /ajax-api/* calls once
+  # the Host check was fixed. Fine for this self-contained/single-VM deployment; tighten
+  # both to an explicit allowlist if you expose this instance more broadly.
+  MLFLOW_SERVER_ALLOWED_HOSTS: "*"
+  MLFLOW_SERVER_CORS_ALLOWED_ORIGINS: "*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: fin-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mlflow }
+  template:
+    metadata:
+      labels: { app: mlflow }
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:latest
+          command: ["sh", "-c"]
+          args:
+            - |
+              exec python -m mlflow server \
+                --host "$HOST" --port "$PORT" --workers 1 \
+                --backend-store-uri "$MLFLOW_SQLSTORE_URI" \
+                --default-artifact-root "$MLFLOW_ARTIFACT_ROOT"
+          envFrom:
+            - configMapRef: { name: mlflow-config }
+          ports:
+            - containerPort: 5000
+          resources:
+            requests: { memory: 512Mi, cpu: 100m }
+            limits: { memory: 3Gi }
+          startupProbe:
+            httpGet: { path: /, port: 5000 }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /, port: 5000 }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/fin-agent/mlflow
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: fin-agent
+spec:
+  selector: { app: mlflow }
+  ports:
+    - port: 5000
+      targetPort: 5000

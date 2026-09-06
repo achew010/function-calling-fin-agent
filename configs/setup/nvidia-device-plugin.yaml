@@ -1,0 +1,49 @@
+# NVIDIA device plugin — exposes the GPU as one nvidia.com/gpu resource so Kubernetes
+# can schedule against it. No time-slicing: this project targets a single GPU running
+# one workload at a time (a training job, or a vLLM inference job — never both at once),
+# so one slot for the one physical GPU is the right default. No nodeSelector either:
+# runs on every node (FAIL_ON_INIT_ERROR=false means it exits quietly on a node with no
+# GPU instead of crash-looping), which keeps this usable on a single-node barebones VM
+# without requiring a custom node-label scheme.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      runtimeClassName: nvidia
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-device-plugin-ctr
+          # v0.17.4+ required for unified-memory (Grace/Blackwell-class) GPUs — earlier
+          # versions crash with "error getting device memory: Not Supported" on them;
+          # harmless to use on H100/other discrete-memory GPUs too.
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.17.4
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins

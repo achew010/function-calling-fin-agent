@@ -1,0 +1,94 @@
+# Smoke test for the GRPO pipeline (1_training/2_grpo/train_grpo.py): proves dataset
+# construction (reusing 2_evaluations/run_internal_eval.py's instance builder), the
+# reward function, rollout generation, the GRPO policy update, and checkpoint saving all
+# work end-to-end. Run before a real GRPO run, not alongside smoke-test-job.yaml or
+# anything in ../inference/ (which now also holds the BFCL benchmark job) — this
+# project targets a single GPU running one workload at a time.
+#
+# Deliberately NOT a faithful preview of real GRPO training: --base-model is the raw
+# Qwen/Qwen3-8B here, not an SFT checkpoint (smoke-test-job.yaml's checkpoint isn't
+# persisted anywhere durable — it lives in that job's ephemeral container). A real GRPO
+# run should point --base-model at a real SFT checkpoint (see 1_training/2_grpo/README.md
+# for why RL needs a warm-started policy). max-steps/num-generations/tiny-data below are
+# smoke-test-only overrides passed as explicit CLI flags — train_grpo.py's own defaults
+# are unchanged. Unlike the BFCL eval, no separate vLLM server is needed: GRPOConfig's
+# use_vllm defaults to False, so rollout generation happens via the policy model's own
+# .generate() in-process.
+#
+# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+#
+# Build the source ConfigMap before applying (GRPO needs the same two upstream files SFT
+# does, since it reuses run_internal_eval.py's instance builder, which itself imports
+# prepare_dataset.py's call-syntax parser):
+#
+#   kubectl create configmap fin-agent-grpo-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
+#     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py
+#   kubectl create configmap fin-agent-grpo-data -n fin-agent \
+#     --from-file=train.jsonl=<(head -20 0_data/data/train.jsonl)
+#
+# Run:    kubectl apply -f configs/templates/training/grpo-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo-smoke-test -f
+# Clean up (Jobs don't self-delete):
+#   kubectl -n fin-agent delete job fin-agent-grpo-smoke-test
+#   kubectl -n fin-agent delete configmap fin-agent-grpo-src fin-agent-grpo-data
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-grpo-smoke-test
+  namespace: fin-agent
+spec:
+  backoffLimit: 0                  # a broken pipeline needs a human, not a silent retry
+  activeDeadlineSeconds: 1800      # 30 min ceiling
+  template:
+    metadata:
+      labels: { app: fin-agent-grpo-smoke-test }
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: grpo-smoke-test
+          image: nvcr.io/nvidia/pytorch:26.05-py3   # same image as smoke-test-job.yaml — see its comment on why a recent tag matters
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
+                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
+                "jinja2>=3.1.0" mlflow
+              mkdir -p /workspace/data
+              cp /src/*.py /workspace/
+              cp /data/train.jsonl /workspace/data/
+              python3 train_grpo.py \
+                --base-model Qwen/Qwen3-8B \
+                --train-file /workspace/data/train.jsonl \
+                --output-dir /workspace/checkpoints/grpo-smoke-test \
+                --max-steps 6 \
+                --num-generations 2 --per-device-batch-size 2 \
+                --max-completion-length 64 \
+                --logging-steps 1 \
+                --save-strategy steps --save-steps 6 \
+                --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --mlflow-experiment-name fin-agent-grpo-smoke-test
+              echo "--- checkpoint contents (proves model saving worked) ---"
+              ls -la /workspace/checkpoints/grpo-smoke-test
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            requests: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi }
+            limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: data, mountPath: /data }
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-grpo-src }
+        - name: data
+          configMap: { name: fin-agent-grpo-data }
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

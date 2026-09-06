@@ -1,0 +1,98 @@
+# Smoke test for the SFT pipeline (1_training/1_sft/train_sft.py): proves data loading,
+# the training loop, the generation-based eval callback, and checkpoint saving all work
+# end-to-end, before trusting the real (hours-long, full-dataset) training run to the
+# same code. Run this before a real training run, not alongside anything in ../inference/ or
+# grpo-job.yaml — this project targets a single GPU running one workload at a time.
+#
+# Deliberately NOT a faithful preview of the real run's numbers: max-steps/eval-strategy/
+# eval-steps/tiny-data below are smoke-test-only overrides passed as explicit CLI flags —
+# train_sft.py's own defaults (epoch-based, full dataset) are unchanged and are what the
+# real run uses. Only change these values here, never in train_sft.py itself.
+#
+# Prerequisite: run setup/setup.sh first (creates the namespace + MLflow this job logs to).
+#
+# Code + a 20/8-example real-data slice (head of the real prepared splits, not
+# fabricated) ship as ConfigMaps and get pip-installed at pod start, rather than baking a
+# custom image — these files are all small text (well under the 1MiB ConfigMap limit).
+# Build them from the fin_agent project root before applying this job:
+#
+#   kubectl create configmap fin-agent-sft-src -n fin-agent \
+#     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
+#     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=metrics.py=1_training/1_sft/metrics.py \
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py
+#   kubectl create configmap fin-agent-smoke-data -n fin-agent \
+#     --from-file=train.jsonl=<(head -20 0_data/data/train.jsonl) \
+#     --from-file=val.jsonl=<(head -8 0_data/data/val.jsonl)
+#
+# Run:    kubectl apply -f configs/templates/training/smoke-test-job.yaml
+# Logs:   kubectl -n fin-agent logs -l app=fin-agent-smoke-test -f
+# Clean up (Jobs don't self-delete):
+#   kubectl -n fin-agent delete job fin-agent-sft-smoke-test
+#   kubectl -n fin-agent delete configmap fin-agent-sft-src fin-agent-smoke-data
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-sft-smoke-test
+  namespace: fin-agent
+spec:
+  backoffLimit: 0                  # a broken pipeline needs a human, not a silent retry
+  activeDeadlineSeconds: 1800      # 30 min ceiling — 10 steps + a tiny generation-based eval should be minutes, not that
+  template:
+    metadata:
+      labels: { app: fin-agent-smoke-test }
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      containers:
+        - name: sft-smoke-test
+          # A recent NVIDIA PyTorch NGC image with broad CUDA compute-capability support
+          # (Ampere/Hopper and newer, incl. H100). An older tag can silently ship a torch
+          # build that doesn't recognize a newer GPU's compute capability at all — hit
+          # this for real on different hardware and had to bump to a newer tag; if
+          # `torch.cuda.is_available()` or CUDA ops fail here, try a newer tag first.
+          image: nvcr.io/nvidia/pytorch:26.05-py3
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "transformers>=4.44.0" "peft>=0.12.0" "trl>=0.15.0" \
+                "accelerate>=0.33.0" "datasets>=2.19.0" "scikit-learn>=1.4.0" "openai>=1.40.0" \
+                "jinja2>=3.1.0" mlflow
+              mkdir -p /workspace/data
+              cp /src/*.py /workspace/
+              cp /data/train.jsonl /data/val.jsonl /workspace/data/
+              python3 train_sft.py \
+                --base-model Qwen/Qwen3-8B \
+                --train-file /workspace/data/train.jsonl \
+                --val-file /workspace/data/val.jsonl \
+                --output-dir /workspace/checkpoints/smoke-test \
+                --max-steps 10 \
+                --per-device-batch-size 1 --grad-accum 1 \
+                --eval-strategy steps --eval-steps 5 \
+                --save-strategy steps --save-steps 10 \
+                --logging-steps 1 \
+                --metrics-eval-samples 8 --metrics-max-new-tokens 64 \
+                --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --mlflow-experiment-name fin-agent-sft-smoke-test
+              echo "--- checkpoint contents (proves model saving worked) ---"
+              ls -la /workspace/checkpoints/smoke-test
+          env:
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          resources:
+            requests: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi }
+            limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: data, mountPath: /data }
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-sft-src }
+        - name: data
+          configMap: { name: fin-agent-smoke-data }
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }

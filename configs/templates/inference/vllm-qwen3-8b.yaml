@@ -1,0 +1,90 @@
+# vLLM inference server for Qwen/Qwen3-8B — the baseline model
+# 2_evaluations/run_bfcl_eval.py defaults to, matching what 1_training/1_sft/
+# fine-tunes (see that README for why the two have to match). Used by
+# ./bfcl-eval-job.yaml, but generic: point anything else that needs an
+# OpenAI-compatible endpoint at fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local:8000
+# too. Don't run alongside ../training/*.yaml — one GPU, one workload at a time.
+#
+# Prerequisite: run setup/setup.sh first (creates the namespace this lives in).
+#
+# Run:    kubectl apply -f configs/templates/inference/vllm-qwen3-8b.yaml
+#         kubectl -n fin-agent rollout status deploy/fin-agent-vllm-qwen3-8b --timeout=900s
+# Clean up (a Deployment — it never exits on its own):
+#         kubectl -n fin-agent delete -f configs/templates/inference/vllm-qwen3-8b.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fin-agent-vllm-qwen3-8b
+  namespace: fin-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: fin-agent-vllm-qwen3-8b }
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-qwen3-8b }
+    spec:
+      runtimeClassName: nvidia
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:cu130-nightly
+          imagePullPolicy: IfNotPresent
+          # max-model-len bumped from an initial 8192: some BFCL "live_*" categories send
+          # long prompts + request up to 4096 output tokens, and one test case hit
+          # "This model's maximum context length is 8192 tokens... requested 4096 output
+          # tokens and prompt contains 4097 input tokens" — a self-imposed ceiling, not a
+          # real limit (Qwen3-8B's native max is 40960). gpu-memory-utilization bumped
+          # 0.3->0.5 to grow the KV-cache pool alongside it, since raising max-model-len
+          # alone doesn't add memory — it only raises the per-request ceiling against the
+          # same pool, which would otherwise shrink max concurrency. At 0.3/8192 the
+          # server logged "KV cache size: 126,928 tokens" (~56KB/token for Qwen3-8B's
+          # GQA config) for ~17.4 GiB; 0.5 grows that pool roughly proportionally, giving
+          # headroom for concurrent requests without the per-request ceiling eating
+          # nearly all of it. An H100 has plenty of room to raise this further if you
+          # want more concurrency headroom.
+          command:
+            - sh
+            - -c
+            - >-
+              exec vllm serve Qwen/Qwen3-8B
+              --served-model-name Qwen/Qwen3-8B
+              --gpu-memory-utilization 0.5
+              --max-model-len 32768
+              --host 0.0.0.0 --port 8000
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          ports:
+            - containerPort: 8000
+          resources:
+            limits: { nvidia.com/gpu: 1 }   # the whole GPU — no time-slicing (see setup/nvidia-device-plugin.yaml)
+          startupProbe:                     # weight download (~16GB) + load
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80            # ~20 min budget
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+          volumeMounts:
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: hf-cache
+          hostPath: { path: /var/lib/hf-cache, type: DirectoryOrCreate }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fin-agent-vllm-qwen3-8b
+  namespace: fin-agent
+spec:
+  selector: { app: fin-agent-vllm-qwen3-8b }
+  ports:
+    - port: 8000
+      targetPort: 8000
