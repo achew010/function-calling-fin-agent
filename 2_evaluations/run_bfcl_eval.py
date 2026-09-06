@@ -81,7 +81,13 @@ class BFCLEvaluator(Evaluator):
     ) -> None:
         if model not in MODEL_CONFIG_MAPPING:
             raise ValueError(f"Unknown BFCL model id {model!r} — run `bfcl models` to see valid ids.")
-        if MODEL_CONFIG_MAPPING[model].is_fc_model:
+        # Exposed (not just checked here) so callers like log_bfcl_to_mlflow.py can log
+        # which registration was actually evaluated — the public leaderboard tracks FC
+        # and Prompt as separate rows with different scores (e.g. Qwen3-8B (FC) vs.
+        # Qwen3-8B (Prompt)), so a run's MLflow record is unreadable in six months
+        # without this if the model id alone doesn't make it obvious.
+        self.is_fc_model = MODEL_CONFIG_MAPPING[model].is_fc_model
+        if self.is_fc_model:
             warnings.warn(
                 f"{model!r} is a '-FC' (native function-calling API) registration. "
                 "This project's fine-tune uses prompting-style tool calls (tools as "

@@ -25,11 +25,37 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import mlflow
 
 from run_bfcl_eval import BFCLEvaluator
+
+# The public leaderboard's own headline "Overall Acc" is a composite across five domains
+# (Agentic, Multi-Turn, Single-Turn/AST, Hallucination, Format Sensitivity), with Agentic
+# alone weighted 40% -- verified directly against the live leaderboard
+# (gorilla.cs.berkeley.edu) and its BFCL_v4 changelog. This project's "python" test
+# category only ever covers the Single-Turn/AST domain (bfcl-eval==2025.8.6.2 predates
+# BFCL_v4's Agentic categories entirely -- Web Search and Memory Management didn't exist
+# yet), split the same way the leaderboard itself splits it: every "live_*" category is
+# Live (AST), everything else in our set is Non-Live (AST). Comparing our flat average
+# across all 11 categories against the leaderboard's "Overall Acc" column is comparing
+# two different statistics -- e.g. Qwen3-8B (Prompt) shows "Overall Acc" 40.43 on the
+# live leaderboard (dragged down by ~13% Agentic accuracy) but "Non-Live (AST)" 88.56 /
+# "Live (AST)" 80.09 -- it's those two columns this project's numbers are actually
+# comparable to.
+BFCL_COMPARABILITY_NOTE = (
+    "Only Non-Live/Live AST (Single-Turn) categories are evaluated here -- no Agentic "
+    "(Web Search/Memory), Multi-Turn, or Hallucination coverage, since those either "
+    "didn't exist yet in the pinned bfcl-eval version or aren't in this project's "
+    "'python' test-category scope. Compare bfcl_non_live_ast_accuracy / "
+    "bfcl_live_ast_accuracy against the public leaderboard's 'Non-Live (AST)' / "
+    "'Live (AST)' columns for the matching model+variant row -- NOT against the "
+    "leaderboard's composite 'Overall Acc' column, which weights Agentic accuracy at "
+    "40% and will read much lower for any model (including this one) that domain was "
+    "never evaluated on."
+)
 
 
 def read_category_summaries(score_dir: Path, model: str) -> dict[str, dict]:
@@ -44,6 +70,25 @@ def read_category_summaries(score_dir: Path, model: str) -> dict[str, dict]:
         if first_line:
             summaries[category] = json.loads(first_line)
     return summaries
+
+
+def group_accuracy(group: dict[str, dict]) -> tuple[float | None, int, int]:
+    """(accuracy, correct_count, total_count) for a group of category summaries --
+    None accuracy (rather than 0.0) when the group is empty, so callers can distinguish
+    "not yet run" from "ran and got every case wrong"."""
+    correct = sum(s.get("correct_count", 0) for s in group.values())
+    total = sum(s.get("total_count", 0) for s in group.values())
+    return (correct / total if total else None), correct, total
+
+
+def split_non_live_live(summaries: dict[str, dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Matches the public leaderboard's own Non-Live (AST) / Live (AST) grouping: every
+    BFCL category prefixed "live_" is Live, everything else (simple/irrelevance/
+    parallel/multiple/parallel_multiple) is Non-Live -- verified against the live
+    leaderboard's category naming, not assumed."""
+    live = {c: s for c, s in summaries.items() if c.startswith("live_")}
+    non_live = {c: s for c, s in summaries.items() if not c.startswith("live_")}
+    return non_live, live
 
 
 def main() -> None:
@@ -120,6 +165,16 @@ def main() -> None:
         mlflow.log_param("test_category", args.test_category)
         mlflow.log_param("backend", args.backend)
         mlflow.log_param("num_threads", args.num_threads)
+        # Which leaderboard row this run is actually the analogue of (FC and Prompt are
+        # tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
+        # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both
+        # necessary to interpret this run at all, months later or by someone else.
+        mlflow.log_param("model_variant", "FC" if evaluator.is_fc_model else "Prompt")
+        try:
+            mlflow.log_param("bfcl_eval_version", pkg_version("bfcl-eval"))
+        except Exception:
+            pass  # best-effort -- never fail the run over a version-string lookup
+        mlflow.log_param("bfcl_comparability_note", BFCL_COMPARABILITY_NOTE)
 
         predictions = evaluator.run_predictions(eval_dataset)
         evaluator.compute_metrics(predictions)
@@ -131,6 +186,24 @@ def main() -> None:
             mlflow.log_metric(f"bfcl_{category}_accuracy", summary.get("accuracy", 0.0))
             mlflow.log_metric(f"bfcl_{category}_correct_count", summary.get("correct_count", 0))
             mlflow.log_metric(f"bfcl_{category}_total_count", summary.get("total_count", 0))
+
+        # The two numbers actually comparable to the public leaderboard -- see
+        # BFCL_COMPARABILITY_NOTE above for why bfcl_overall_accuracy below is not.
+        non_live, live = split_non_live_live(summaries)
+        non_live_acc, non_live_correct, non_live_total = group_accuracy(non_live)
+        live_acc, live_correct, live_total = group_accuracy(live)
+        if non_live_acc is not None:
+            mlflow.log_metric("bfcl_non_live_ast_accuracy", non_live_acc)
+            mlflow.log_metric("bfcl_non_live_ast_correct_count", non_live_correct)
+            mlflow.log_metric("bfcl_non_live_ast_total_count", non_live_total)
+        if live_acc is not None:
+            mlflow.log_metric("bfcl_live_ast_accuracy", live_acc)
+            mlflow.log_metric("bfcl_live_ast_correct_count", live_correct)
+            mlflow.log_metric("bfcl_live_ast_total_count", live_total)
+
+        # Kept for detail, but NOT the number to compare against the leaderboard with --
+        # it's a flat average across only this project's 11-category subset, not the
+        # leaderboard's own weighted, five-domain "Overall Acc" composite.
         total_correct = sum(s.get("correct_count", 0) for s in summaries.values())
         total_count = sum(s.get("total_count", 0) for s in summaries.values())
         if total_count:
