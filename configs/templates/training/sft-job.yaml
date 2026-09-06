@@ -77,7 +77,7 @@ spec:
                 --train-file /data/prepared/train.jsonl \
                 --val-file /data/prepared/val.jsonl \
                 --output-dir /checkpoints/sft \
-                --per-device-batch-size 16 --grad-accum 1 --max-seq-length 8192 \
+                --per-device-batch-size 32 --grad-accum 1 --max-seq-length 8192 \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-sft
               echo "--- checkpoint contents ---"

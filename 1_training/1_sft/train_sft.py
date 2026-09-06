@@ -236,11 +236,11 @@ def main() -> None:
     parser.add_argument(
         "--per-device-batch-size",
         type=int,
-        default=16,
-        help="16 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
+        default=32,
+        help="32 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
         "small adapter) leaves an H100 with plenty of headroom, so a larger "
         "per-device batch cuts wall-clock time. Paired with --grad-accum 1 below "
-        "for an effective batch size of 16 with no accumulation.",
+        "for an effective batch size of 32 with no accumulation.",
     )
     parser.add_argument(
         "--grad-accum",
@@ -248,7 +248,7 @@ def main() -> None:
         default=1,
         help="1 (not 8) by default — --per-device-batch-size above already reaches "
         "the target effective batch size on its own; raise this instead of "
-        "--per-device-batch-size if 16 turns out to be too large for the GPU's memory.",
+        "--per-device-batch-size if 32 turns out to be too large for the GPU's memory.",
     )
     parser.add_argument(
         "--max-seq-length",
