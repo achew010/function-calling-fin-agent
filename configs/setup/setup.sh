@@ -102,34 +102,12 @@ kubectl config set-context --current --namespace=fin-agent
 # custom image (see configs/README.md's design notes) — built here, once, from
 # PROJECT_ROOT, so `kubectl apply -f templates/...` just works afterward instead of
 # failing with FailedMount/ContainerCreating until someone remembers to build it by hand
-# (the exact failure mode that motivated adding this). --dry-run=client -o yaml |
-# kubectl apply -f - makes each one idempotent, so rerunning setup.sh (e.g. after
-# editing one of these .py files) safely updates the existing ConfigMap in place.
+# (the exact failure mode that motivated adding this). rebuild-configmaps.sh is
+# idempotent (--dry-run=client -o yaml | kubectl apply -f - per ConfigMap), so rerunning
+# it here (or standalone, after any later `git pull`) safely updates each one in place —
+# see that script's own header for why re-running it is not optional after a pull.
 echo ">> Building job source ConfigMaps"
-
-kubectl create configmap fin-agent-data-prep-src -n fin-agent \
-  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl create configmap fin-agent-sft-src -n fin-agent \
-  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
-  --from-file=run_internal_eval.py="${PROJECT_ROOT}/2_evaluations/run_internal_eval.py" \
-  --from-file=metrics.py="${PROJECT_ROOT}/1_training/1_sft/metrics.py" \
-  --from-file=train_sft.py="${PROJECT_ROOT}/1_training/1_sft/train_sft.py" \
-  --from-file=tox.ini="${PROJECT_ROOT}/tox.ini" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl create configmap fin-agent-grpo-src -n fin-agent \
-  --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
-  --from-file=run_internal_eval.py="${PROJECT_ROOT}/2_evaluations/run_internal_eval.py" \
-  --from-file=train_grpo.py="${PROJECT_ROOT}/1_training/2_grpo/train_grpo.py" \
-  --from-file=tox.ini="${PROJECT_ROOT}/tox.ini" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl create configmap fin-agent-bfcl-src -n fin-agent \
-  --from-file=run_bfcl_eval.py="${PROJECT_ROOT}/2_evaluations/run_bfcl_eval.py" \
-  --from-file=log_bfcl_to_mlflow.py="${PROJECT_ROOT}/2_evaluations/log_bfcl_to_mlflow.py" \
-  --dry-run=client -o yaml | kubectl apply -f -
+"${SCRIPT_DIR}/rebuild-configmaps.sh"
 
 echo ""
 echo "=============================================================="

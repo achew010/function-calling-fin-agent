@@ -84,8 +84,18 @@ spec:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
           resources:
-            requests: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi }
-            limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
+            # 32Gi (smoke-test-job.yaml's own limit) OOMKilled a real run right at
+            # merge_and_unload()/save_pretrained() -- confirmed via Kubernetes' own
+            # OOMKilled pod status, not a CUDA OOM traceback, so this is container/system
+            # RAM, not GPU memory. GRPO's rollout generation (num_generations completions
+            # sampled in-process via model.generate(), plus their log-probs/advantages)
+            # holds more in memory during training than SFT's plain forward/backward
+            # pass, before the merge step's own need to briefly hold both pre- and
+            # post-merge weights even begins. Matching grpo-real-job.yaml's allocation
+            # rather than guessing a smaller number, since that's already a proven
+            # reference point in this codebase (same as sft-job.yaml's real-run sizing).
+            requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 20Gi }
+            limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
           volumeMounts:
             - { name: src, mountPath: /src }
             - { name: dataset, mountPath: /data/prepared, readOnly: true }

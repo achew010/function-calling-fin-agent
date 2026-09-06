@@ -18,7 +18,8 @@ configs/
 
 | File | Purpose |
 |---|---|
-| `setup/setup.sh` | Installs k3s, the NVIDIA runtime + device plugin (if a GPU is present), the `fin-agent` namespace, and MLflow. Run this first. |
+| `setup/setup.sh` | Installs k3s, the NVIDIA runtime + device plugin (if a GPU is present), the `fin-agent` namespace, MLflow, and every job source ConfigMap (via `rebuild-configmaps.sh`). Run this first. |
+| `setup/rebuild-configmaps.sh` | Rebuilds every job source ConfigMap from the current local checkout. **Run this after every `git pull`** — a Job's ConfigMap is a separate, already-applied object nothing updates automatically, so a stale one silently keeps running old code with no error. `setup.sh` calls this same script; it's also here standalone so a pull doesn't require rerunning all of `setup.sh`. |
 | `setup/nvidia-runtimeclass.yaml`, `setup/nvidia-device-plugin.yaml` | Let Kubernetes schedule against the GPU (`nvidia.com/gpu`). Applied by `setup.sh`; no time-slicing — one GPU, one workload at a time, matching how the templates below are designed to be run. |
 | `setup/namespace.yaml` | The `fin-agent` namespace everything else lives in. |
 | `setup/mlflow.yaml` | Self-contained MLflow (ClusterIP + SQLite + hostPath) — a fresh instance for this VM, not tied to any external ingress hostname. |
