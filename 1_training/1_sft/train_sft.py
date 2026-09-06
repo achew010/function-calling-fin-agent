@@ -33,6 +33,7 @@ import contextlib
 import json
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -426,6 +427,17 @@ def main() -> None:
         merged_model = trainer.model.merge_and_unload()
         merged_model.save_pretrained(str(args.output_dir))
         tokenizer.save_pretrained(str(args.output_dir))
+        # Trainer's own periodic checkpoints (output_dir/checkpoint-<step>/, containing
+        # the pre-merge adapter plus optimizer/scheduler/rng state for resuming
+        # training) are redundant now: the best one was already reloaded into
+        # trainer.model (load_best_model_at_end, above) and merged into the save just
+        # above. Left in place, they'd sit alongside the real deliverable in both
+        # output_dir and (via log_artifacts below) MLflow's Artifacts tab, with no clear
+        # signal which one is actually "the" model — confirmed this was confusing in
+        # practice, not just a hypothetical.
+        for checkpoint_dir in Path(args.output_dir).glob("checkpoint-*"):
+            if checkpoint_dir.is_dir():
+                shutil.rmtree(checkpoint_dir)
         if args.mlflow:
             # The two save calls above only write to local disk. MLflowCallback does
             # have its own artifact upload (on_save), but it's gated behind the
