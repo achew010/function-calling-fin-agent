@@ -57,6 +57,20 @@ BFCL_COMPARABILITY_NOTE = (
     "never evaluated on."
 )
 
+# Qwen/Qwen3-8B's own leaderboard rows, read directly off gorilla.cs.berkeley.edu (page's
+# own "Last Updated: 2026-04-12" stamp) -- logged as metrics (not just params) below,
+# under the SAME names as our own bfcl_non_live_ast_accuracy/bfcl_live_ast_accuracy but
+# prefixed "leaderboard_", specifically so both sit side by side as directly-comparable
+# numeric columns in MLflow's own metrics table/run-comparison view, not just documented
+# in a note someone has to go read. Re-verify against the live page if it's been a while
+# -- "will be updated periodically" per the leaderboard's own description -- and update
+# these two entries; nothing else in this file needs to change if the leaderboard adds or
+# reorders other models.
+LEADERBOARD_QWEN3_8B_REFERENCE = {
+    "Prompt": {"non_live_ast": 0.8856, "live_ast": 0.8009},
+    "FC": {"non_live_ast": 0.8758, "live_ast": 0.8053},
+}
+
 
 def read_category_summaries(score_dir: Path, model: str) -> dict[str, dict]:
     model_dir = score_dir / model
@@ -169,7 +183,8 @@ def main() -> None:
         # tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
         # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both
         # necessary to interpret this run at all, months later or by someone else.
-        mlflow.log_param("model_variant", "FC" if evaluator.is_fc_model else "Prompt")
+        model_variant = "FC" if evaluator.is_fc_model else "Prompt"
+        mlflow.log_param("model_variant", model_variant)
         try:
             mlflow.log_param("bfcl_eval_version", pkg_version("bfcl-eval"))
         except Exception:
@@ -200,6 +215,17 @@ def main() -> None:
             mlflow.log_metric("bfcl_live_ast_accuracy", live_acc)
             mlflow.log_metric("bfcl_live_ast_correct_count", live_correct)
             mlflow.log_metric("bfcl_live_ast_total_count", live_total)
+
+        # The public leaderboard's own reference numbers for this exact model+variant,
+        # logged as metrics (not just documented in BFCL_COMPARABILITY_NOTE) so they show
+        # up as directly-comparable numeric columns right alongside
+        # bfcl_non_live_ast_accuracy/bfcl_live_ast_accuracy in MLflow's own metrics
+        # table/run-comparison view -- no need to go find and re-read this file or the
+        # live leaderboard page just to eyeball how close a run came.
+        leaderboard_ref = LEADERBOARD_QWEN3_8B_REFERENCE.get(model_variant)
+        if leaderboard_ref:
+            mlflow.log_metric("leaderboard_non_live_ast_accuracy", leaderboard_ref["non_live_ast"])
+            mlflow.log_metric("leaderboard_live_ast_accuracy", leaderboard_ref["live_ast"])
 
         # Kept for detail, but NOT the number to compare against the leaderboard with --
         # it's a flat average across only this project's 11-category subset, not the

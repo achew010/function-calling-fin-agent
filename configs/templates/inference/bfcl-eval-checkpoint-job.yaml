@@ -1,54 +1,62 @@
-# Smoke eval: BFCL against the checkpoint from ../training/smoke-test-job.yaml, proving
-# the SFT-checkpoint -> vLLM -> BFCL chain works end-to-end, cheaply, before trusting the
-# full-suite bfcl-eval-job.yaml run (which evaluates the raw/real model over all 3491
-# python-category cases and takes hours). Deliberately NOT a faithful preview of real
-# BFCL numbers: a checkpoint trained for 10 steps on 20 examples, and a single small test
-# category (live_relevance, 18 cases — the smallest of the python categories, see
-# run_bfcl_eval.py's own category-size notes), are both smoke-test-only choices. This is
-# checking that the plumbing works, not producing a meaningful accuracy number.
+# Template (NOT directly kubectl-apply-able — substitute __CHECKPOINT__ first, see
+# below): BFCL evaluation against a local checkpoint under
+# /var/lib/fin-agent/checkpoints/__CHECKPOINT__ (smoke-test/sft/grpo — whichever training
+# job produced it), with its own bundled vLLM Deployment serving that checkpoint
+# directly. Defaults to a single small test category (live_relevance, 18 cases — the
+# smallest of the python categories, see run_bfcl_eval.py's own category-size notes) so
+# evaluating several checkpoints in a row (see run-bfcl-eval-suite.sh) stays cheap —
+# swap --test-category to `python` below for a full, leaderboard-comparable run once a
+# specific checkpoint is worth the hours that takes.
+#
+# Rendered and applied by run-bfcl-eval-suite.sh, which substitutes __CHECKPOINT__ (a
+# plain `sed` replacement — no templating engine dependency) once per checkpoint being
+# evaluated; that script is the intended entry point; a bare `kubectl apply -f` on this
+# file as-is will fail (invalid resource names) or, in the past, evaluate whatever
+# checkpoint the last substitution left behind. To render+apply by hand for one checkpoint:
+#   sed 's/__CHECKPOINT__/smoke-test/g' bfcl-eval-checkpoint-job.yaml | kubectl apply -f -
 #
 # Bundles its own vLLM Deployment (unlike bfcl-eval-job.yaml, which points at the
-# separately-managed, reusable ../inference/vllm-qwen3-8b.yaml): this one serves a
-# throwaway smoke checkpoint nothing else should ever point at, so there's no reuse case
-# for splitting it out. Not alongside anything in ../training/ or
+# separately-managed, reusable ../inference/vllm-qwen3-8b.yaml): each of these serves a
+# one-off local checkpoint nothing else should point at, so there's no reuse case for
+# splitting it out. Not alongside anything in ../training/ or
 # ../inference/vllm-qwen3-8b.yaml — this project targets a single GPU running one
 # workload at a time.
 #
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
-#   2. ../training/smoke-test-job.yaml, run to completion first — this is the checkpoint
-#      served below:
-#        kubectl apply -f configs/templates/training/smoke-test-job.yaml
-#        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-sft-smoke-test --timeout=1800s
+#   2. Whichever training job produces /var/lib/fin-agent/checkpoints/__CHECKPOINT__,
+#      run to completion first (see run-bfcl-eval-suite.sh's own CHECKPOINTS list for
+#      which job that is per name).
 #
-# Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses):
+# Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses; also
+# built by setup/rebuild-configmaps.sh):
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
 #     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
 #
-# Run:
-#   kubectl apply -f configs/templates/inference/bfcl-smoke-eval-job.yaml
-#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-smoke --timeout=600s
-#   kubectl -n fin-agent wait --for=condition=complete job/fin-agent-bfcl-smoke-eval --timeout=1800s
-#   kubectl -n fin-agent logs -l app=fin-agent-bfcl-smoke-eval -f
+# Run (prefer run-bfcl-eval-suite.sh, which does this substitution+apply+wait for one or
+# more checkpoints in sequence):
+#   sed 's/__CHECKPOINT__/smoke-test/g' bfcl-eval-checkpoint-job.yaml | kubectl apply -f -
+#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-smoke-test --timeout=600s
+#   kubectl -n fin-agent wait --for=condition=complete job/fin-agent-bfcl-eval-smoke-test --timeout=1800s
+#   kubectl -n fin-agent logs -l app=fin-agent-bfcl-eval-smoke-test -f
 #
 # Clean up (the vLLM server is a Deployment — it never exits on its own):
-#   kubectl -n fin-agent delete -f configs/templates/inference/bfcl-smoke-eval-job.yaml
-#   kubectl -n fin-agent delete configmap fin-agent-bfcl-src
+#   sed 's/__CHECKPOINT__/smoke-test/g' bfcl-eval-checkpoint-job.yaml | kubectl delete -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: fin-agent-vllm-smoke
+  name: fin-agent-vllm-__CHECKPOINT__
   namespace: fin-agent
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
-    matchLabels: { app: fin-agent-vllm-smoke }
+    matchLabels: { app: fin-agent-vllm-__CHECKPOINT__ }
   template:
     metadata:
-      labels: { app: fin-agent-vllm-smoke }
+      labels: { app: fin-agent-vllm-__CHECKPOINT__ }
     spec:
       runtimeClassName: nvidia
       containers:
@@ -63,7 +71,7 @@ spec:
             - sh
             - -c
             - >-
-              exec vllm serve /checkpoints/smoke-test
+              exec vllm serve /checkpoints/__CHECKPOINT__
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
               --max-model-len 8192
@@ -84,8 +92,8 @@ spec:
             periodSeconds: 10
           volumeMounts:
             # type: Directory (not DirectoryOrCreate): this must already exist, written
-            # by smoke-test-job.yaml -- failing fast on a missing mount beats vLLM's own
-            # confusing error if that prerequisite was skipped.
+            # by the training job that produced it -- failing fast on a missing mount
+            # beats vLLM's own confusing error if that prerequisite was skipped.
             - { name: checkpoints, mountPath: /checkpoints, readOnly: true }
             - { name: shm, mountPath: /dev/shm }
       volumes:
@@ -97,10 +105,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: fin-agent-vllm-smoke
+  name: fin-agent-vllm-__CHECKPOINT__
   namespace: fin-agent
 spec:
-  selector: { app: fin-agent-vllm-smoke }
+  selector: { app: fin-agent-vllm-__CHECKPOINT__ }
   ports:
     - port: 8000
       targetPort: 8000
@@ -108,18 +116,18 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fin-agent-bfcl-smoke-eval
+  name: fin-agent-bfcl-eval-__CHECKPOINT__
   namespace: fin-agent
 spec:
   backoffLimit: 0                  # a broken pipeline needs a human, not a silent retry
   activeDeadlineSeconds: 1800      # 30 min ceiling — 18 cases against a warm local server should be minutes, not that
   template:
     metadata:
-      labels: { app: fin-agent-bfcl-smoke-eval }
+      labels: { app: fin-agent-bfcl-eval-__CHECKPOINT__ }
     spec:
       restartPolicy: Never
       containers:
-        - name: bfcl-smoke-eval
+        - name: bfcl-eval
           image: python:3.12-slim   # no GPU needed here — this container only talks HTTP to the vLLM Service above
           workingDir: /workspace
           command:
@@ -131,7 +139,7 @@ spec:
               cp /src/*.py /workspace/
               python3 -c "
               import time, urllib.request
-              url = 'http://fin-agent-vllm-smoke.fin-agent.svc.cluster.local:8000/health'
+              url = 'http://fin-agent-vllm-__CHECKPOINT__.fin-agent.svc.cluster.local:8000/health'
               for i in range(60):
                   try:
                       urllib.request.urlopen(url, timeout=5)
@@ -144,10 +152,10 @@ spec:
               python3 log_bfcl_to_mlflow.py \
                 --model Qwen/Qwen3-8B --test-category live_relevance \
                 --skip-server-setup --num-threads 8 \
-                --vllm-endpoint fin-agent-vllm-smoke.fin-agent.svc.cluster.local --vllm-port 8000 \
-                --bfcl-project-root /tmp/bfcl-smoke \
+                --vllm-endpoint fin-agent-vllm-__CHECKPOINT__.fin-agent.svc.cluster.local --vllm-port 8000 \
+                --bfcl-project-root /tmp/bfcl-__CHECKPOINT__ \
                 --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
-                --mlflow-experiment-name fin-agent-bfcl-smoke-eval
+                --mlflow-experiment-name fin-agent-bfcl-eval-__CHECKPOINT__
           resources:
             requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 4Gi }
             limits: { cpu: "2", memory: 4Gi, ephemeral-storage: 10Gi }

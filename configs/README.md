@@ -32,7 +32,8 @@ configs/
 | `templates/inference/vllm-qwen3-8b.yaml` | vLLM serving the Qwen3-8B baseline — a standing Deployment, not a one-off Job. |
 | `templates/inference/bfcl-eval-job.yaml` | BFCL evaluation against the vLLM deployment above. **Depends on it being up** — use `run-bfcl-eval.sh`, not a bare `kubectl apply`, unless you're managing that dependency yourself. |
 | `templates/inference/run-bfcl-eval.sh` | Applies the vLLM deployment, waits for it to be Ready, then applies and follows the eval Job — the one-command way to run the benchmark without forgetting the server it needs. |
-| `templates/inference/bfcl-smoke-eval-job.yaml` | BFCL evaluation (one small category, `live_relevance`) against `smoke-test-job.yaml`'s checkpoint, with its own bundled vLLM Deployment — proves the SFT-checkpoint→vLLM→BFCL chain cheaply, before trusting the full-suite run. |
+| `templates/inference/bfcl-eval-checkpoint-job.yaml` | Template (substitute `__CHECKPOINT__` — see its header) for a BFCL evaluation against a local training checkpoint, with its own bundled vLLM Deployment. Defaults to one small category (`live_relevance`) for a quick, cheap check. Rendered and applied by `run-bfcl-eval-suite.sh`, not `kubectl apply`ed directly. |
+| `templates/inference/run-bfcl-eval-suite.sh` | Evaluates the raw baseline plus every local checkpoint (smoke-test/sft/grpo) that exists on this node against BFCL, one at a time, in one command — smoke scale by default (`FULL_SCALE=1` for the real `python` category). Logs each model's `bfcl_non_live_ast_accuracy`/`bfcl_live_ast_accuracy` to its own MLflow experiment, alongside the public leaderboard's reference numbers for direct comparison. |
 
 ## Quickstart
 
