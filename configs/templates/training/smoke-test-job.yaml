@@ -88,7 +88,7 @@ spec:
                 --eval-strategy steps --eval-steps 5 \
                 --save-strategy steps --save-steps 10 \
                 --logging-steps 1 \
-                --metrics-eval-samples 8 --metrics-max-new-tokens 64 \
+                --metrics-eval-samples 8 --metrics-max-new-tokens 256 \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-sft-smoke-test
               echo "--- checkpoint contents (proves model saving worked) ---"
