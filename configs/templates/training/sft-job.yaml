@@ -86,6 +86,13 @@ spec:
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+            # Hit a real CUDA OOM mid-run (step 470/1785) with only 3.31GiB free but
+            # 10.15GiB "reserved by PyTorch but unallocated" -- fragmentation, not a
+            # genuine capacity shortfall (gradient checkpointing's repeated
+            # allocate/free-on-recompute pattern is a known contributor). This is
+            # PyTorch's own suggested fix for exactly that symptom, not a guess.
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
           resources:
             requests: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi }
             limits: { cpu: "8", memory: 64Gi, ephemeral-storage: 40Gi, nvidia.com/gpu: 1 }

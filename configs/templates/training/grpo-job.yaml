@@ -77,6 +77,11 @@ spec:
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+            # See sft-job.yaml's own copy of this var: a real CUDA OOM there was
+            # allocator fragmentation (large "reserved but unallocated" gap), not a
+            # genuine capacity shortfall -- PyTorch's own suggested fix for that symptom.
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
           resources:
             # Starting point, matching sft-job.yaml's real-run sizing -- unvalidated for
             # GRPO's own memory profile (rollout generation holds more in flight than

@@ -98,6 +98,11 @@ spec:
           env:
             - name: HF_TOKEN
               valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+            # See sft-job.yaml's own copy of this var for why: a real CUDA OOM there was
+            # allocator fragmentation (large "reserved but unallocated" gap), not a
+            # genuine capacity shortfall -- PyTorch's own suggested fix for that symptom.
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
           resources:
             requests: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi }
             limits: { cpu: "4", memory: 32Gi, ephemeral-storage: 20Gi, nvidia.com/gpu: 1 }
