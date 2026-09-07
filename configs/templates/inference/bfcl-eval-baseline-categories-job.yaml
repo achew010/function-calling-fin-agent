@@ -1,0 +1,95 @@
+# Template (NOT directly kubectl-apply-able — substitute __TEST_CATEGORIES__ first, see
+# below): BFCL evaluation of the raw Qwen/Qwen3-8B baseline (no fine-tuning) against
+# ../inference/vllm-qwen3-8b.yaml's Deployment, looping over one or more test
+# categories in a single MLflow run — same __TEST_CATEGORIES__ mechanism as
+# bfcl-eval-mlflow-checkpoint-job.yaml (see that file's header for why: a smoke pass
+# needs two small categories, one Non-Live + one Live, to populate both
+# bfcl_non_live_ast_accuracy/bfcl_live_ast_accuracy, since no small built-in BFCL
+# collection spans both groups on its own). Job-only — no bundled Deployment/Service/PVC
+# beyond the results PVC, since vllm-qwen3-8b.yaml already provides the server and
+# ../inference/bfcl-eval-mlflow-checkpoint-job.yaml already declares
+# fin-agent-bfcl-mlflow-results (this file redeclares the identical spec too, so it's
+# still self-sufficient if applied on its own — kubectl apply on an unchanged PVC spec
+# is a no-op).
+#
+# Not used by run-bfcl-eval.sh/bfcl-eval-job.yaml (those are untouched, single-category-
+# python, unrelated to this) — this is specifically for run-bfcl-eval-run-ids-suite.sh's
+# baseline leg, kept separate so that existing usage isn't disturbed.
+#
+# Rendered and applied by run-bfcl-eval-run-ids-suite.sh; to render+apply by hand:
+#   kubectl apply -f vllm-qwen3-8b.yaml
+#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-qwen3-8b --timeout=900s
+#   sed 's/__TEST_CATEGORIES__/parallel live_parallel/g' bfcl-eval-baseline-categories-job.yaml | kubectl apply -f -
+#
+# Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses):
+#   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
+#     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fin-agent-bfcl-mlflow-results
+  namespace: fin-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 5Gi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-bfcl-eval-qwen3-8b
+  namespace: fin-agent
+spec:
+  backoffLimit: 3   # see bfcl-eval-mlflow-checkpoint-job.yaml's identical field for why
+  template:
+    metadata:
+      labels: { app: fin-agent-bfcl-eval-qwen3-8b }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bfcl-eval
+          image: python:3.12-slim
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "bfcl-eval==2025.8.6.2" transformers soundfile jinja2 mlflow openai aiohttp
+              cp /src/*.py /workspace/
+              python3 -c "
+              import time, urllib.request
+              url = 'http://fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local:8000/health'
+              for i in range(80):
+                  try:
+                      urllib.request.urlopen(url, timeout=5)
+                      print('vLLM server is ready'); break
+                  except Exception as e:
+                      print(f'waiting for vLLM server ({i+1}/80): {e}'); time.sleep(15)
+              else:
+                  raise SystemExit('vLLM server did not become ready in time — apply ../inference/vllm-qwen3-8b.yaml first')
+              "
+              mkdir -p /data/bfcl-qwen3-8b
+              for category in __TEST_CATEGORIES__; do
+                echo "--- category: ${category} ---"
+                python3 log_bfcl_to_mlflow.py \
+                  --model Qwen/Qwen3-8B --test-category "${category}" \
+                  --skip-server-setup --num-threads 8 \
+                  --vllm-endpoint fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local --vllm-port 8000 \
+                  --bfcl-project-root /data/bfcl-qwen3-8b \
+                  --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                  --mlflow-experiment-name fin-agent-bfcl \
+                  --run-id-file /data/bfcl-qwen3-8b/mlflow_run_id.txt
+              done
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: bfcl-data, mountPath: /data }
+          resources:
+            requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 4Gi }
+            limits: { cpu: "2", memory: 4Gi, ephemeral-storage: 10Gi }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-bfcl-src }
+        - name: bfcl-data
+          persistentVolumeClaim: { claimName: fin-agent-bfcl-mlflow-results }

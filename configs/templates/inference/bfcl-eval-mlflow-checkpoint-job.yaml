@@ -1,0 +1,203 @@
+# Template (NOT directly kubectl-apply-able — substitute __NAME__/__RUN_ID__/
+# __TEST_CATEGORIES__ first, see below): BFCL evaluation against a specific MLflow-
+# tracked run's model artifact, with its own bundled vLLM Deployment that pulls the
+# model via mlflow.artifacts.download_artifacts(run_id=__RUN_ID__) — same mechanism as
+# ../inference/vllm-grpo-mtp.yaml, minus that file's MTP/structured-outputs flags (this
+# is a correctness eval; speculative decoding would just fail to start on a checkpoint
+# with no trained MTP head, and BFCL doesn't send guided_json requests that would
+# exercise structured-output decoding anyway).
+#
+# __TEST_CATEGORIES__ is a space-separated, unquoted list substituted straight into a
+# bash `for category in __TEST_CATEGORIES__; do ... done` loop — one
+# log_bfcl_to_mlflow.py invocation per category, all sharing the same
+# --bfcl-project-root and --run-id-file so every category's score lands in the same
+# MLflow run (read_category_summaries() re-globs every BFCL_v3_*_score.json under that
+# root each call, so the LAST category's invocation logs cumulative, correct
+# bfcl_non_live_ast_accuracy/bfcl_live_ast_accuracy across every category run so far —
+# this is what lets a smoke pass cover both Non-Live and Live AST in one MLflow run
+# despite run_bfcl_eval.py only ever accepting one --test-category per process).
+# run-bfcl-eval-run-ids-suite.sh picks "parallel live_parallel" (199+15=214 cases,
+# smallest available Non-Live/Live pair — see that script) for a smoke pass, or just
+# "python" (the real, leaderboard-comparable 3491-case collection, already spans both
+# groups in one category) for the real one.
+#
+# Rendered and applied by run-bfcl-eval-run-ids-suite.sh; to render+apply by hand for
+# one model:
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' \
+#       -e 's/__TEST_CATEGORIES__/parallel live_parallel/g' \
+#       bfcl-eval-mlflow-checkpoint-job.yaml | kubectl apply -f -
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job logs to and pulls from)
+#   2. The MLflow run must have a "model" artifact (train_sft.py/train_grpo.py with
+#      --mlflow both log one, at model.log_artifacts(..., artifact_path="model"))
+#
+# Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses):
+#   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
+#     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
+#
+# Clean up (the vLLM server is a Deployment — it never exits on its own):
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__TEST_CATEGORIES__/parallel live_parallel/g' \
+#       bfcl-eval-mlflow-checkpoint-job.yaml | kubectl delete -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fin-agent-bfcl-mlflow-results
+  namespace: fin-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 5Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: fin-agent-vllm-__NAME__ }
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-__NAME__ }
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        - name: fetch-model
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir mlflow
+              python3 -c "
+              import mlflow
+              mlflow.artifacts.download_artifacts(run_id='__RUN_ID__', artifact_path='model', dst_path='/model')
+              "
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.fin-agent.svc.cluster.local:5000
+          volumeMounts:
+            - { name: mlflow-artifacts, mountPath: /data/artifacts, readOnly: true }
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:cu130-nightly   # same image as ../inference/vllm-qwen3-8b.yaml
+          imagePullPolicy: IfNotPresent
+          # --served-model-name Qwen/Qwen3-8B (not the local path), matching
+          # bfcl-eval-checkpoint-job.yaml's reasoning: keeps run_bfcl_eval.py's
+          # MODEL_CONFIG_MAPPING lookup (keyed on model id string, not on what's
+          # actually being served) resolving the same prompt-formatting/response-
+          # parsing handler as the real baseline.
+          command:
+            - sh
+            - -c
+            - >-
+              exec vllm serve /model
+              --served-model-name Qwen/Qwen3-8B
+              --gpu-memory-utilization 0.5
+              --max-model-len 32768
+              --host 0.0.0.0 --port 8000
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80            # ~20 min budget -- includes the MLflow-artifact download, not just weight load
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
+        - name: model-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  selector: { app: fin-agent-vllm-__NAME__ }
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-bfcl-eval-__NAME__
+  namespace: fin-agent
+spec:
+  # backoffLimit>0 + restartPolicy: OnFailure so a killed pod is retried automatically --
+  # same reasoning as bfcl-eval-job.yaml: results/scores/run-id live on a PVC, and
+  # bfcl generate skips test cases already present in its result file, so a restart
+  # resumes instead of redoing completed categories from scratch.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app: fin-agent-bfcl-eval-__NAME__ }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bfcl-eval
+          image: python:3.12-slim
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir "bfcl-eval==2025.8.6.2" transformers soundfile jinja2 mlflow openai aiohttp
+              cp /src/*.py /workspace/
+              python3 -c "
+              import time, urllib.request
+              url = 'http://fin-agent-vllm-__NAME__.fin-agent.svc.cluster.local:8000/health'
+              for i in range(80):
+                  try:
+                      urllib.request.urlopen(url, timeout=5)
+                      print('vLLM server is ready'); break
+                  except Exception as e:
+                      print(f'waiting for vLLM server ({i+1}/80): {e}'); time.sleep(15)
+              else:
+                  raise SystemExit('vLLM server did not become ready in time — apply this file first and wait for the Deployment rollout')
+              "
+              mkdir -p /data/bfcl-__NAME__
+              for category in __TEST_CATEGORIES__; do
+                echo "--- category: ${category} ---"
+                python3 log_bfcl_to_mlflow.py \
+                  --model Qwen/Qwen3-8B --test-category "${category}" \
+                  --skip-server-setup --num-threads 8 \
+                  --vllm-endpoint fin-agent-vllm-__NAME__.fin-agent.svc.cluster.local --vllm-port 8000 \
+                  --bfcl-project-root /data/bfcl-__NAME__ \
+                  --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                  --mlflow-experiment-name fin-agent-bfcl-eval-__NAME__ \
+                  --run-id-file /data/bfcl-__NAME__/mlflow_run_id.txt
+              done
+          volumeMounts:
+            - { name: src, mountPath: /src }
+            - { name: bfcl-data, mountPath: /data }
+          resources:
+            requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 4Gi }
+            limits: { cpu: "2", memory: 4Gi, ephemeral-storage: 10Gi }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-bfcl-src }
+        - name: bfcl-data
+          persistentVolumeClaim: { claimName: fin-agent-bfcl-mlflow-results }
