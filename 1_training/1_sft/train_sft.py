@@ -54,7 +54,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-from metrics import call_correctness, score_detailed
+from metrics import aggregate_metrics, score_detailed
 
 CALL_TYPES = ["single", "parallel", "multi_turn", "no_call"]
 
@@ -165,6 +165,15 @@ class FunctionCallEvalCallback(TrainerCallback):
                         max_new_tokens=self.max_new_tokens,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
+                        # gradient_checkpointing=True (see SFTConfig below) makes
+                        # transformers force model.config.use_cache=False for training,
+                        # and nothing re-enables it for eval -- without this override,
+                        # every one of these generate() calls recomputes the full
+                        # sequence from scratch at each new token instead of using a KV
+                        # cache. use_cache here is a call-level override (generate()'s
+                        # own effective GenerationConfig), so it doesn't need undoing
+                        # before model.train() resumes.
+                        use_cache=True,
                     )
                     completion_ids = output_ids[0][inputs["input_ids"].shape[1] :]
                     completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
@@ -173,13 +182,28 @@ class FunctionCallEvalCallback(TrainerCallback):
         if was_training:
             model.train()
 
-        fc_correctness = call_correctness(scored_examples)
+        detailed = aggregate_metrics(scored_examples)
+        # full_call_accuracy is the same computation call_correctness() used to do
+        # separately (see metrics.py) -- reading it off the aggregate dict instead
+        # keeps there being exactly one place that logic lives.
+        fc_correctness = detailed.get("full_call_accuracy")
         # Default to 0.0 (rather than leaving the key absent) when this round's sample
         # happened to contain zero call-cases: metric_for_best_model="fc_call_correctness"
         # (see main()) needs this key present on every eval round, or
         # _determine_best_metric raises KeyError the first time it's missing.
         metrics["eval_fc_call_correctness"] = fc_correctness if fc_correctness is not None else 0.0
-        self.trainer.log({"eval_fc_call_correctness": metrics["eval_fc_call_correctness"]})
+        # Everything else aggregate_metrics computed (tool-selection accuracy,
+        # param value/type accuracy, hallucination rate, per-error-type rates, ...)
+        # logged too, not just the single scalar above -- so a run that trends down on
+        # fc_call_correctness can be diagnosed (which error type is driving it) without
+        # having to rerun eval against saved checkpoints after the fact. Excludes
+        # full_call_accuracy itself, already covered by eval_fc_call_correctness above.
+        self.trainer.log(
+            {
+                "eval_fc_call_correctness": metrics["eval_fc_call_correctness"],
+                **{f"eval_{k}": v for k, v in detailed.items() if k != "full_call_accuracy"},
+            }
+        )
 
 
 def main() -> None:
@@ -205,12 +229,16 @@ def main() -> None:
     parser.add_argument(
         "--target-modules",
         nargs="+",
-        default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        default=["q_proj", "k_proj", "v_proj", "o_proj"],
         help=(
-            "Attention-only (q/k/v/o_proj) is a common but underpowered default for a "
-            "task like this: teaching the model a new *output format* (JSON call "
-            "schema instead of ToolACE's native syntax) leans heavily on the MLP "
-            "blocks, so gate/up/down_proj are included by default too."
+            "Attention-only by default (dropped gate/up/down_proj — MLP adapters add "
+            "a lot of trainable capacity, and a run showed eval_fc_call_correctness "
+            "degrading over training while teacher-forced loss/token-accuracy kept "
+            "improving, a pattern consistent with that extra capacity overfitting to "
+            "surface token patterns rather than real call correctness). Matches "
+            "train_grpo.py's target_modules, which was already attention-only. Add "
+            "gate/up/down_proj back if attention-only turns out to be underpowered "
+            "for learning the JSON call schema."
         ),
     )
     parser.add_argument("--epochs", type=float, default=1.0)
@@ -252,6 +280,17 @@ def main() -> None:
         "--per-device-batch-size if 16 turns out to be too large for the GPU's memory.",
     )
     parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=4,
+        help="Smaller than --per-device-batch-size on purpose: Trainer's teacher-forced "
+        "eval loop stacks its own forward-pass activations on top of whatever "
+        "gradient checkpointing already has resident from training (see sft-job.yaml's "
+        "own comment on a real CUDA OOM this caused), and unlike the train batch, "
+        "there's no gradient/optimizer state riding on eval throughput to justify a "
+        "larger batch here.",
+    )
+    parser.add_argument(
         "--max-seq-length",
         type=int,
         default=8192,
@@ -284,8 +323,8 @@ def main() -> None:
     parser.add_argument(
         "--metrics-eval-samples",
         type=int,
-        default=30,
-        help="Validation examples to run real generation-based metrics on per eval (see FunctionCallEvalCallback) — kept small since generation is expensive.",
+        default=50,
+        help="Validation examples to run real generation-based metrics on per eval (see FunctionCallEvalCallback) — kept small since generation is expensive (unbatched, one model.generate() call per example). Bumped 30->50 for a less noisy eval_fc_call_correctness/error-rate signal.",
     )
     parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -336,7 +375,7 @@ def main() -> None:
         max_steps=args.max_steps,
         learning_rate=args.lr,
         per_device_train_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=args.per_device_batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         warmup_steps=args.warmup_ratio,  # see --warmup-ratio's help above for why this isn't warmup_ratio
         max_length=args.max_seq_length,  # trl renamed SFTConfig's max_seq_length -> max_length in newer releases; CLI flag name kept for stability
