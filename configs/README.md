@@ -25,7 +25,7 @@ configs/
 | `setup/mlflow.yaml` | Self-contained MLflow (ClusterIP + SQLite + hostPath) — a fresh instance for this VM, not tied to any external ingress hostname. |
 | `templates/training/prepare-dataset-job.yaml` | Runs `0_data/prepare_dataset.py` once, writing train/val/test.jsonl to a shared PVC (`fin-agent-dataset`). Run this before any other training job below — they all read from it. |
 | `templates/training/sft-smoke-job.yaml` | SFT smoke test — 10 training steps, a step-based eval, and a checkpoint save. |
-| `templates/training/sft-job.yaml` | The real SFT run — full ToolACE-derived dataset, `train_sft.py`'s own defaults (3 epochs, epoch-based eval/save), checkpoint persisted to hostPath. |
+| `templates/training/sft-job.yaml` | The real SFT run — full ToolACE-derived dataset, `train_sft.py`'s own defaults (1 epoch, gradient checkpointing, eval/save every 140 steps), checkpoint persisted to hostPath. |
 | `templates/training/grpo-smoke-job.yaml` | GRPO smoke test — dataset construction, reward function, rollout generation, and a checkpoint save. Warm-starts from `sft-smoke-job.yaml`'s checkpoint, not the raw base model. |
 | `templates/training/run-grpo-smoke-chain.sh` | Runs dataset prep → SFT smoke test → GRPO smoke test in sequence, one command — exercises the SFT→GRPO checkpoint handoff end-to-end. |
 | `templates/training/grpo-job.yaml` | The real GRPO run — full dataset, `train_grpo.py`'s own defaults, warm-started from `sft-job.yaml`'s checkpoint (not the smoke one). Run `grpo-smoke-job.yaml` first to prove the pipeline works. |

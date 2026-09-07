@@ -1,6 +1,7 @@
 # The real SFT run (1_training/1_sft/train_sft.py) — full ToolACE-derived dataset,
-# train_sft.py's own defaults (3 epochs, LoRA bf16, epoch-based eval/save), not the
-# smoke test's 10-step/tiny-data overrides. --per-device-batch-size/--grad-accum/
+# train_sft.py's own defaults (1 epoch, LoRA bf16, gradient checkpointing, eval/save
+# every 140 steps), not the smoke test's 10-step/tiny-data overrides.
+# --per-device-batch-size/--grad-accum/
 # --max-seq-length below are spelled out explicitly (matching sft-smoke-job.yaml)
 # even though they're currently just train_sft.py's own defaults too, so the real
 # run's actual memory footprint is visible here rather than only in train_sft.py's
@@ -53,7 +54,7 @@ metadata:
   namespace: fin-agent
 spec:
   backoffLimit: 0             # a training run that dies mid-way needs a human, not a silent retry
-  activeDeadlineSeconds: 86400  # 24h ceiling — 3 epochs over the full dataset on 1 GPU is hours, not minutes, but not unbounded either
+  activeDeadlineSeconds: 86400  # 24h ceiling — 1 epoch over the full dataset on 1 GPU is hours, not minutes, but not unbounded either
   template:
     metadata:
       labels: { app: fin-agent-sft }
@@ -77,7 +78,7 @@ spec:
                 --train-file /data/prepared/train.jsonl \
                 --val-file /data/prepared/val.jsonl \
                 --output-dir /checkpoints/sft \
-                --per-device-batch-size 32 --grad-accum 1 --max-seq-length 8192 \
+                --per-device-batch-size 16 --grad-accum 1 --max-seq-length 8192 \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-sft
               echo "--- checkpoint contents ---"

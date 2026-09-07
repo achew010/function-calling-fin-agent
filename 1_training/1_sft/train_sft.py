@@ -213,7 +213,7 @@ def main() -> None:
             "blocks, so gate/up/down_proj are included by default too."
         ),
     )
-    parser.add_argument("--epochs", type=float, default=3.0)
+    parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -237,11 +237,11 @@ def main() -> None:
     parser.add_argument(
         "--per-device-batch-size",
         type=int,
-        default=32,
-        help="32 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
+        default=16,
+        help="16 (not 2) by default: LoRA's memory footprint (frozen backbone + a "
         "small adapter) leaves an H100 with plenty of headroom, so a larger "
         "per-device batch cuts wall-clock time. Paired with --grad-accum 1 below "
-        "for an effective batch size of 32 with no accumulation.",
+        "for an effective batch size of 16 with no accumulation.",
     )
     parser.add_argument(
         "--grad-accum",
@@ -249,7 +249,7 @@ def main() -> None:
         default=1,
         help="1 (not 8) by default — --per-device-batch-size above already reaches "
         "the target effective batch size on its own; raise this instead of "
-        "--per-device-batch-size if 32 turns out to be too large for the GPU's memory.",
+        "--per-device-batch-size if 16 turns out to be too large for the GPU's memory.",
     )
     parser.add_argument(
         "--max-seq-length",
@@ -263,13 +263,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--eval-strategy",
-        default="epoch",
+        default="steps",
         choices=["no", "steps", "epoch"],
-        help="'epoch' can silently never fire the eval loop when --max-steps stops training before one epoch completes — use 'steps' + --eval-steps for a smoke run.",
+        help="'steps' (not 'epoch') by default so the generation-based eval fires at a "
+        "fixed cadence regardless of dataset size or epoch count — 'epoch' can also "
+        "silently never fire the eval loop when --max-steps stops training before one "
+        "epoch completes. Paired with --eval-steps 140 below.",
     )
-    parser.add_argument("--eval-steps", type=int, default=None)
-    parser.add_argument("--save-strategy", default="epoch", choices=["no", "steps", "epoch"])
-    parser.add_argument("--save-steps", type=int, default=None)
+    parser.add_argument("--eval-steps", type=int, default=140)
+    parser.add_argument(
+        "--save-strategy",
+        default="steps",
+        choices=["no", "steps", "epoch"],
+        help="Kept equal to --eval-strategy (both 'steps') — load_best_model_at_end "
+        "requires save_strategy == eval_strategy, with save_steps a multiple of "
+        "eval_steps (verified against TrainingArguments' own validation).",
+    )
+    parser.add_argument("--save-steps", type=int, default=140)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument(
         "--metrics-eval-samples",
@@ -341,14 +351,22 @@ def main() -> None:
         # Trainer reloads state.best_model_checkpoint into self.model at the end of
         # train() when this is set. Requires eval_strategy == save_strategy (and, for
         # "steps", save_steps a multiple of eval_steps) — already true of both this
-        # script's own defaults (epoch/epoch) and the smoke test's overrides
-        # (steps/steps, 10 % 5 == 0); see TrainingArguments' own validation for why.
+        # script's own defaults (steps/steps, 140 % 140 == 0) and the smoke test's
+        # overrides (steps/steps, 10 % 5 == 0); see TrainingArguments' own validation for why.
         load_best_model_at_end=True,
         metric_for_best_model="fc_call_correctness",
         greater_is_better=True,
         bf16=True,
         dataset_text_field="text",
         report_to=[],
+        # Trades compute for activation memory: without this, training already sits
+        # within ~3.6GiB of the 80GiB H100 ceiling at batch 16/seq 8192 (hit a real CUDA
+        # OOM on the first epoch-boundary eval, which stacks its own forward-pass
+        # activations on top of that). SFTTrainer handles the PEFT-specific wiring
+        # (model.enable_input_require_grads(), use_reentrant) internally when this is
+        # set on SFTConfig — verified against the installed trl version's source, not
+        # assumed.
+        gradient_checkpointing=True,
     )
 
     fc_callback = FunctionCallEvalCallback(
