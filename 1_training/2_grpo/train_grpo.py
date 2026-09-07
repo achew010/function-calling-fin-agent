@@ -207,7 +207,14 @@ def main() -> None:
             mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         if args.mlflow_experiment_name:
             mlflow.set_experiment(args.mlflow_experiment_name)
-        mlflow_run = mlflow.start_run()
+        # log_system_metrics=True: samples GPU/CPU/RAM usage every 10s (mlflow default)
+        # for the run's duration -- see train_sft.py's own version of this same change
+        # for the fuller explanation (needs `nvidia-ml-py` installed for GPU metrics
+        # specifically). Especially relevant here: rollout generation is the memory
+        # spike train_sft.py's system metrics can't show, since GRPO's is a separate
+        # failure mode (already hit OOM + eviction on this job once -- see
+        # grpo-smoke-job.yaml's memory limits).
+        mlflow_run = mlflow.start_run(log_system_metrics=True)
         mlflow.log_params(
             {
                 "lora_r": args.lora_r,

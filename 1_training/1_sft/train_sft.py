@@ -416,7 +416,13 @@ def main() -> None:
             mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         if args.mlflow_experiment_name:
             mlflow.set_experiment(args.mlflow_experiment_name)
-        mlflow_run = mlflow.start_run()
+        # log_system_metrics=True: samples GPU/CPU/RAM usage every 10s (mlflow default)
+        # for the run's duration -- needs `nvidia-ml-py` installed (tox.ini) for the
+        # gpu_* metrics specifically, or it silently falls back to CPU/RAM/disk only
+        # (verified against mlflow's GPUMonitor source). Would have shown VRAM climbing
+        # toward the ceiling in real time instead of only finding out via a CUDA OOM
+        # traceback after the fact.
+        mlflow_run = mlflow.start_run(log_system_metrics=True)
         mlflow.log_params(
             {
                 "lora_r": args.lora_r,
