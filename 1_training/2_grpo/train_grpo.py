@@ -21,6 +21,7 @@ Usage:
     python train_grpo.py \
         --base-model ../1_sft/checkpoints/sft-general \
         --train-file ../../0_data/data/train.jsonl \
+        --val-file ../../0_data/data/val.jsonl \
         --output-dir checkpoints/grpo-general
 """
 
@@ -40,6 +41,16 @@ from typing import Any
 # one piece of logic, not two that can quietly drift apart.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "2_evaluations"))
 from run_internal_eval import build_eval_instances, load_examples, normalize_calls, parse_prediction  # noqa: E402
+
+# Reuse the exact generation-based eval callback train_sft.py already built (real
+# model.generate() against a held-out sample, scored via metrics.py's aggregate_metrics)
+# rather than reimplementing it a second time -- same reasoning as reusing
+# run_internal_eval.py above: the eval mechanism and the metric name it reports
+# (fc_call_correctness) should be identical across both stages, not two copies that can
+# quietly drift apart. Needs train_sft.py + metrics.py present alongside this file --
+# see grpo-job.yaml/grpo-smoke-job.yaml's ConfigMap build commands.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "1_sft"))
+from train_sft import FunctionCallEvalCallback  # noqa: E402
 
 from datasets import Dataset
 from peft import LoraConfig
@@ -117,6 +128,15 @@ def main() -> None:
         help="Starting policy — the SFT checkpoint from ../1_sft/, not the raw base model (see module docstring).",
     )
     parser.add_argument("--train-file", type=Path, required=True)
+    parser.add_argument(
+        "--val-file",
+        type=Path,
+        required=True,
+        help="Held-out split for FunctionCallEvalCallback (see train_sft.py) -- GRPO "
+        "previously had no held-out eval at all, just the training-rollout reward, so "
+        "there was nothing to catch a reward-optimized policy drifting away from real "
+        "correctness, and no 'best' checkpoint to restore if it did.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-generations", type=int, default=8, help="Group size G — completions sampled per prompt.")
     parser.add_argument("--max-completion-length", type=int, default=512)
@@ -138,9 +158,43 @@ def main() -> None:
         help="Overrides --epochs when > 0 — e.g. for a smoke run of a fixed number of steps regardless of dataset size.",
     )
     parser.add_argument("--per-device-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=4,
+        help="Decoupled from --per-device-batch-size, same reasoning as train_sft.py's "
+        "own --eval-batch-size: eval's own forward/generate passes stack on top of "
+        "whatever training already has resident, so it gets its own, smaller knob "
+        "rather than silently scaling with the train batch size.",
+    )
     parser.add_argument("--logging-steps", type=int, default=10)
-    parser.add_argument("--save-strategy", default="epoch", choices=["no", "steps", "epoch"])
-    parser.add_argument("--save-steps", type=int, default=None)
+    parser.add_argument(
+        "--eval-strategy",
+        default="steps",
+        choices=["no", "steps", "epoch"],
+        help="'steps' (not 'epoch') by default, matching train_sft.py -- fires the "
+        "held-out eval at a fixed cadence regardless of dataset size or epoch count. "
+        "Paired with --eval-steps 140 below.",
+    )
+    parser.add_argument("--eval-steps", type=int, default=140)
+    parser.add_argument(
+        "--save-strategy",
+        default="steps",
+        choices=["no", "steps", "epoch"],
+        help="'steps' (not the previous default 'epoch'): load_best_model_at_end "
+        "requires save_strategy == eval_strategy, with save_steps a multiple of "
+        "eval_steps (see train_sft.py's identical requirement) -- 'epoch' can't "
+        "satisfy that whenever --max-steps stops training before an epoch completes.",
+    )
+    parser.add_argument("--save-steps", type=int, default=140)
+    parser.add_argument(
+        "--metrics-eval-samples",
+        type=int,
+        default=50,
+        help="Validation examples FunctionCallEvalCallback runs real generation-based "
+        "metrics on per eval -- see train_sft.py's identical flag.",
+    )
+    parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument(
@@ -151,6 +205,11 @@ def main() -> None:
     args = parser.parse_args()
 
     train_dataset = build_grpo_dataset(args.train_file)
+    # Also gives GRPOTrainer's own built-in eval loop (reward/kl/entropy/completion-
+    # length, computed the same way as training rollouts) on real held-out data for
+    # free, on top of FunctionCallEvalCallback's richer metrics.py breakdown below --
+    # both need a non-None eval_dataset to fire at all (Trainer raises otherwise).
+    eval_dataset = build_grpo_dataset(args.val_file)
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -173,10 +232,27 @@ def main() -> None:
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         logging_steps=args.logging_steps,
+        eval_strategy=args.eval_strategy,
+        eval_steps=args.eval_steps,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
+        # Mirrors train_sft.py: reload the checkpoint with the best real,
+        # generation-based fc_call_correctness (FunctionCallEvalCallback below) at the
+        # end of train(), rather than merging/saving whatever the final step produced --
+        # this is the actual fix for GRPO previously having no protection against a
+        # reward-optimized policy drifting away from real correctness over the run.
+        load_best_model_at_end=True,
+        metric_for_best_model="fc_call_correctness",
+        greater_is_better=True,
         report_to=[],
+    )
+
+    fc_callback = FunctionCallEvalCallback(
+        args.val_file,
+        eval_samples=args.metrics_eval_samples,
+        max_new_tokens=args.metrics_max_new_tokens,
     )
 
     trainer = GRPOTrainer(
@@ -184,8 +260,11 @@ def main() -> None:
         reward_funcs=reward_func,
         args=grpo_config,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         peft_config=lora_config,
+        callbacks=[fc_callback],
     )
+    fc_callback.trainer = trainer  # see FunctionCallEvalCallback's docstring (train_sft.py) for why
 
     mlflow_run = contextlib.nullcontext()
     if args.mlflow:
@@ -234,7 +313,9 @@ def main() -> None:
         # wraps it in a *fresh* adapter for this stage, so trainer.model is a PeftModel
         # again by the time training finishes. Leaving it unmerged would just move the
         # same "adapter-only checkpoint, unusable as a standalone model" problem one
-        # stage downstream instead of fixing it.
+        # stage downstream instead of fixing it. trainer.model here is the *best*
+        # checkpoint by fc_call_correctness (load_best_model_at_end above), not
+        # necessarily the final step's -- same as train_sft.py.
         merged_model = trainer.model.merge_and_unload()
         merged_model.save_pretrained(str(args.output_dir))
         # train_grpo.py has no separate tokenizer object (GRPOTrainer builds its own
@@ -256,9 +337,7 @@ def main() -> None:
             # artifact upload is gated behind the HF_MLFLOW_LOG_ARTIFACTS env var
             # (unset here) and only fires on the Trainer's own periodic checkpoint
             # saves, never on this final save call. Without this explicit upload,
-            # nothing reaches MLflow's Artifacts tab. GRPO has no held-out eval loop
-            # (unlike train_sft.py), so there's no "best" checkpoint to pick between --
-            # this is just the one final trained state.
+            # nothing reaches MLflow's Artifacts tab.
             mlflow.log_artifacts(str(args.output_dir), artifact_path="model")
 
 

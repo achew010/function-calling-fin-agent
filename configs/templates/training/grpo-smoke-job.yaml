@@ -29,11 +29,18 @@
 # Build the source ConfigMap before applying (GRPO needs the same two upstream files SFT
 # does, since it reuses run_internal_eval.py's instance builder, which itself imports
 # prepare_dataset.py's call-syntax parser — plus tox.ini, reusing the same [testenv:grpo]
-# defined alongside SFT's; see tox.ini's header for why sitepackages=true matters here):
+# defined alongside SFT's; see tox.ini's header for why sitepackages=true matters here).
+# train_sft.py + metrics.py are new: train_grpo.py now imports train_sft.py's
+# FunctionCallEvalCallback directly for its own held-out eval (see train_grpo.py's
+# module docstring), rather than reimplementing it — both files land flat in
+# /workspace alongside everything else below, same as every other cross-directory file
+# here:
 #
 #   kubectl create configmap fin-agent-grpo-src -n fin-agent \
 #     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
 #     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py \
+#     --from-file=metrics.py=1_training/1_sft/metrics.py \
 #     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
 #     --from-file=tox.ini=tox.ini
 #
@@ -70,12 +77,15 @@ spec:
               tox -e grpo -- train_grpo.py \
                 --base-model /checkpoints/smoke-test \
                 --train-file /data/prepared/smoke_train.jsonl \
+                --val-file /data/prepared/smoke_val.jsonl \
                 --output-dir /workspace/checkpoints/grpo-smoke \
                 --max-steps 6 \
                 --num-generations 2 --per-device-batch-size 2 \
                 --max-completion-length 64 \
                 --logging-steps 1 \
+                --eval-strategy steps --eval-steps 3 \
                 --save-strategy steps --save-steps 6 \
+                --metrics-eval-samples 4 --metrics-max-new-tokens 64 \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-grpo-smoke
               echo "--- checkpoint contents (proves model saving worked) ---"

@@ -18,10 +18,15 @@
 #        kubectl apply -f configs/templates/training/sft-job.yaml
 #        kubectl -n fin-agent wait --for=condition=complete job/fin-agent-sft --timeout=86400s
 #
-# Build the source ConfigMap before applying (same one grpo-smoke-job.yaml uses):
+# Build the source ConfigMap before applying (same one grpo-smoke-job.yaml uses —
+# train_sft.py + metrics.py are needed because train_grpo.py now imports train_sft.py's
+# FunctionCallEvalCallback directly for its own held-out eval, see train_grpo.py's
+# module docstring):
 #   kubectl create configmap fin-agent-grpo-src -n fin-agent \
 #     --from-file=prepare_dataset.py=0_data/prepare_dataset.py \
 #     --from-file=run_internal_eval.py=2_evaluations/run_internal_eval.py \
+#     --from-file=train_sft.py=1_training/1_sft/train_sft.py \
+#     --from-file=metrics.py=1_training/1_sft/metrics.py \
 #     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
 #     --from-file=tox.ini=tox.ini
 #
@@ -69,6 +74,7 @@ spec:
               tox -e grpo -- train_grpo.py \
                 --base-model /checkpoints/sft \
                 --train-file /data/prepared/train.jsonl \
+                --val-file /data/prepared/val.jsonl \
                 --output-dir /checkpoints/grpo \
                 --mlflow --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
                 --mlflow-experiment-name fin-agent-grpo

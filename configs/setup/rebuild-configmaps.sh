@@ -40,6 +40,8 @@ kubectl create configmap fin-agent-sft-src -n "${NAMESPACE}" \
 kubectl create configmap fin-agent-grpo-src -n "${NAMESPACE}" \
   --from-file=prepare_dataset.py="${PROJECT_ROOT}/0_data/prepare_dataset.py" \
   --from-file=run_internal_eval.py="${PROJECT_ROOT}/2_evaluations/run_internal_eval.py" \
+  --from-file=metrics.py="${PROJECT_ROOT}/1_training/1_sft/metrics.py" \
+  --from-file=train_sft.py="${PROJECT_ROOT}/1_training/1_sft/train_sft.py" \
   --from-file=train_grpo.py="${PROJECT_ROOT}/1_training/2_grpo/train_grpo.py" \
   --from-file=tox.ini="${PROJECT_ROOT}/tox.ini" \
   --dry-run=client -o yaml | kubectl apply -f -
