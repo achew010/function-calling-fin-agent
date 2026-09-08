@@ -175,21 +175,41 @@ def main() -> None:
         # retry of this process after a pod restart -- can attach to the same run.
         if args.run_id_file:
             Path(args.run_id_file).write_text(run.info.run_id)
-        mlflow.log_param("model", args.model)
-        mlflow.log_param("test_category", args.test_category)
-        mlflow.log_param("backend", args.backend)
-        mlflow.log_param("num_threads", args.num_threads)
-        # Which leaderboard row this run is actually the analogue of (FC and Prompt are
-        # tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
-        # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both
-        # necessary to interpret this run at all, months later or by someone else.
         model_variant = "FC" if evaluator.is_fc_model else "Prompt"
-        mlflow.log_param("model_variant", model_variant)
-        try:
-            mlflow.log_param("bfcl_eval_version", pkg_version("bfcl-eval"))
-        except Exception:
-            pass  # best-effort -- never fail the run over a version-string lookup
-        mlflow.log_param("bfcl_comparability_note", BFCL_COMPARABILITY_NOTE)
+        # Params are IMMUTABLE in MLflow, and this script is invoked once per test
+        # category against the same run whenever a caller shares one --run-id-file
+        # across categories (see bfcl-eval-*-job.yaml's category loop, which does that
+        # so one run ends up holding both Non-Live and Live AST accuracy). Re-logging
+        # test_category on the second category raised INVALID_PARAMETER_VALUE and killed
+        # the job after the first category had already finished. Every param here is
+        # identical across categories except test_category, so log them only when this
+        # process actually started the run; a plain retry of the same category was always
+        # fine (MLflow allows re-logging an identical value) but a second category is not.
+        if existing_run_id is None:
+            mlflow.log_param("model", args.model)
+            # Kept so a single-category run records exactly what it always did. When a
+            # run spans several categories the plural `test_categories` tag below is the
+            # authoritative one -- this param holds whichever category ran first.
+            mlflow.log_param("test_category", args.test_category)
+            mlflow.log_param("backend", args.backend)
+            mlflow.log_param("num_threads", args.num_threads)
+            # Which leaderboard row this run is actually the analogue of (FC and Prompt
+            # are tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
+            # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both
+            # necessary to interpret this run at all, months later or by someone else.
+            mlflow.log_param("model_variant", model_variant)
+            try:
+                mlflow.log_param("bfcl_eval_version", pkg_version("bfcl-eval"))
+            except Exception:
+                pass  # best-effort -- never fail the run over a version-string lookup
+            mlflow.log_param("bfcl_comparability_note", BFCL_COMPARABILITY_NOTE)
+        # Tags, unlike params, can be updated -- so the categories this run actually
+        # covers accumulate here rather than being pinned to whichever one ran first.
+        seen = mlflow.get_run(run.info.run_id).data.tags.get("test_categories", "")
+        covered = [c for c in seen.split(",") if c]
+        if args.test_category not in covered:
+            covered.append(args.test_category)
+        mlflow.set_tag("test_categories", ",".join(covered))
 
         predictions = evaluator.run_predictions(eval_dataset)
         evaluator.compute_metrics(predictions)
