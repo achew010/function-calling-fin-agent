@@ -38,11 +38,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Reuse the exact call-syntax parser 0_data/prepare_dataset.py uses, rather than
-# re-implementing ToolACE's `Name(arg=val)` parsing a second time.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "0_data"))
-from prepare_dataset import try_parse_calls  # noqa: E402
-
 # Reuse the eval's instance-construction and scoring logic — the training-time metrics
 # below and the eval-gate numbers should be computed by one piece of logic, not two.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "2_evaluations"))
@@ -59,17 +54,19 @@ from metrics import aggregate_metrics, score_detailed
 CALL_TYPES = ["single", "parallel", "multi_turn", "no_call"]
 
 
-def render_assistant_turn(content: str) -> str:
-    """Re-render a ToolACE `Name(arg=val)` call turn as the target JSON call schema.
-
-    The production agentic graph's schema validator (see the top-level README) expects
-    structured JSON, not ToolACE's native call syntax — the model has to learn to emit
-    what production actually consumes, not the dataset's own notation.
-    """
-    calls = try_parse_calls(content)
-    if calls is None:
-        return content
-    return json.dumps([{"name": c["name"], "arguments": c["arguments"]} for c in calls])
+# NOTE: assistant turns train on ToolACE's native `[Name(arg=val)]` syntax, deliberately
+# unmodified -- system messages carry the tool list and its instruction to answer in
+# that exact format, so training on it too is what makes the two agree (a prior version
+# re-rendered turns as JSON here, which produced a fine-tune that disobeyed its own
+# system prompt on every single example -- see 0_data/README.md's verification section).
+# 0_data/prepare_dataset.py now also makes that native syntax genuinely BFCL-parseable
+# (real Python identifiers, not ToolACE's free-text tool/parameter names), via
+# rename_tools_for_bfcl -- so this file no longer needs try_parse_calls itself; the
+# renaming already happened once, at dataset-prep time, not per training run.
+#
+# Production still needs JSON: that conversion belongs downstream of the model
+# (try_parse_calls + json.dumps, the same two lines as before) rather than baked into
+# the training target.
 
 
 def load_examples(path: Path) -> list[dict[str, Any]]:
@@ -80,10 +77,7 @@ def load_examples(path: Path) -> list[dict[str, Any]]:
 def to_messages(example: dict[str, Any]) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": example["system"]}]
     for turn in example["turns"]:
-        content = turn["content"]
-        if turn["role"] == "assistant":
-            content = render_assistant_turn(content)
-        messages.append({"role": turn["role"], "content": content})
+        messages.append({"role": turn["role"], "content": turn["content"]})
     return messages
 
 
@@ -238,7 +232,7 @@ def main() -> None:
             "surface token patterns rather than real call correctness). Matches "
             "train_grpo.py's target_modules, which was already attention-only. Add "
             "gate/up/down_proj back if attention-only turns out to be underpowered "
-            "for learning the JSON call schema."
+            "for learning the call format."
         ),
     )
     parser.add_argument("--epochs", type=float, default=1.0)

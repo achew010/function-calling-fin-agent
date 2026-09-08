@@ -29,12 +29,31 @@ LoRA via `peft` + `trl.SFTTrainer`, reading the `train`/`val` splits produced by
 memory during training is tighter than the target GPU allows.
 
 Each ToolACE conversation is converted into the base model's chat template: `system`
-turns carry the tool definitions, `user`/`assistant` turns pass through, and `tool` turns
-(function results) are mapped to the template's tool-response role. Assistant turns that
-are function calls (parsed the same way `0_data/prepare_dataset.py` does) are re-rendered
-as the target JSON schema the production graph's validator expects, not left in ToolACE's
-native `Name(arg=val)` call syntax — the model must learn to emit the schema the internal
-APIs actually consume.
+turns carry the tool definitions, and `user`/`assistant`/`tool` turns pass through
+unmodified.
+
+**Assistant call turns keep ToolACE's native `[Name(arg=val)]` syntax** — not
+re-rendered as JSON. An earlier version did convert them, which was wrong on two counts,
+both confirmed against a served checkpoint: it contradicted the data's own system
+prompt, which ends every example with `Put it in the format of
+[func1(params_name=params_value...)]` / `NO other text MUST be included`, so training
+told the model one format and showed it another on every single example; and it
+discarded BFCL comparability for nothing, since ToolACE's native syntax is the format
+BFCL's own `DEFAULT_SYSTEM_PROMPT` demands (near-identical down to the call template).
+
+That native syntax is now also genuinely BFCL-*parseable*, not just template-compatible
+with it: `0_data/prepare_dataset.py`'s `rename_tools_for_bfcl` sanitizes every tool and
+parameter name into a real Python identifier (ToolACE's own names routinely aren't —
+spaces, apostrophes, hyphens, even bare reserved words like `from`), applied
+consistently to both the system prompt's tool list and the calls that reference it. See
+`0_data/README.md`'s verification section for the measured before/after (52.0% → 100% of
+call turns parseable under BFCL's real `ast_parse`).
+
+Production still needs JSON; that conversion now happens *downstream* of the model
+(`try_parse_calls` + `json.dumps`, the same two lines as before) rather than being baked
+into the training target. `2_evaluations/run_internal_eval.py`'s `parse_prediction`
+reads this same native syntax, so ingestion, training, internal scoring, and BFCL all
+agree on one format.
 
 **Per-workflow adapters:** ToolACE has no fraud/transaction workflow labels, so this
 reference run trains a single general adapter on the full prepared dataset. Once the

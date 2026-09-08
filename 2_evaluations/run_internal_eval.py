@@ -66,19 +66,21 @@ def normalize_calls(calls: list[dict[str, Any]]) -> list[str]:
 
 
 def parse_prediction(text: str) -> list[dict[str, Any]] | None:
-    """The fine-tuned model is trained to emit JSON (see 1_training/render_assistant_turn),
-    not ToolACE's native call syntax — a non-JSON or non-call response counts as a refusal."""
-    try:
-        parsed = json.loads(text.strip())
-    except json.JSONDecodeError:
-        return None
-    if isinstance(parsed, dict):
-        parsed = [parsed]
-    if not isinstance(parsed, list) or not all(
-        isinstance(c, dict) and "name" in c for c in parsed
-    ):
-        return None
-    return parsed
+    """Parse a model response into calls, or None if it isn't one (counts as a refusal).
+
+    Reads ToolACE's native `[Name(arg=val)]` syntax -- the format the model is trained
+    on (see 1_training/1_sft/train_sft.py's to_messages) and, not coincidentally, the
+    one BFCL's own system prompt demands, so a checkpoint scored here and on the
+    leaderboard is judged on the same output format. 0_data/prepare_dataset.py's
+    rename_tools_for_bfcl also makes every tool/parameter name in the training data a
+    real Python identifier, so this is genuinely BFCL-parseable, not just
+    template-compatible with it — see that file's README for the measured before/after.
+
+    try_parse_calls is the same parser 0_data/prepare_dataset.py uses to ingest ToolACE
+    (imported above), so ingestion and scoring can't drift into disagreeing about what
+    counts as a call.
+    """
+    return try_parse_calls(text)
 
 
 def score_instance(
