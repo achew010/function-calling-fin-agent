@@ -47,6 +47,11 @@ NAMESPACE=fin-agent
 SFT_RUN_ID="${SFT_RUN_ID:-e783b52f2b7a42cc8ff2b2786949cb71}"
 GRPO_RUN_ID="${GRPO_RUN_ID:-7ed9c74413964bd4b69ba4e405ad2060}"
 
+# Which legs to run, in order. Trim this to evaluate a subset -- e.g.
+# MODELS="baseline sft" before the GRPO checkpoint exists -- so an unwanted leg doesn't
+# spend GPU time (or fail on a run_id whose model artifact isn't logged yet).
+MODELS="${MODELS:-baseline sft grpo}"
+
 TEST_CATEGORIES="parallel live_parallel"
 WAIT_TIMEOUT=1800s
 if [ "${FULL_SCALE:-0}" = "1" ]; then
@@ -83,9 +88,14 @@ run_mlflow_checkpoint() {
   echo "${rendered}" | kubectl delete -f - --ignore-not-found
 }
 
-run_baseline
-run_mlflow_checkpoint sft "${SFT_RUN_ID}"
-run_mlflow_checkpoint grpo "${GRPO_RUN_ID}"
+for model in ${MODELS}; do
+  case "${model}" in
+    baseline) run_baseline ;;
+    sft)      run_mlflow_checkpoint sft "${SFT_RUN_ID}" ;;
+    grpo)     run_mlflow_checkpoint grpo "${GRPO_RUN_ID}" ;;
+    *)        echo "unknown model '${model}' in MODELS -- expected: baseline sft grpo" >&2; exit 1 ;;
+  esac
+done
 
 echo ""
 echo "=============================================================="
