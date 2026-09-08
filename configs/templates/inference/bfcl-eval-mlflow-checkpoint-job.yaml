@@ -145,16 +145,16 @@ metadata:
   name: fin-agent-bfcl-eval-__NAME__
   namespace: fin-agent
 spec:
-  # backoffLimit>0 + restartPolicy: OnFailure so a killed pod is retried automatically --
-  # same reasoning as bfcl-eval-job.yaml: results/scores/run-id live on a PVC, and
-  # bfcl generate skips test cases already present in its result file, so a restart
-  # resumes instead of redoing completed categories from scratch.
-  backoffLimit: 3
+  # backoffLimit 0 + restartPolicy Never: on BackoffLimitExceeded the job controller
+  # deletes the failed pod and its logs go with it, leaving nothing to debug from. A
+  # failed pod left in Error state is worth more than an automatic retry here; the PVC
+  # still lets bfcl generate resume completed cases on a manual rerun.
+  backoffLimit: 0
   template:
     metadata:
       labels: { app: fin-agent-bfcl-eval-__NAME__ }
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       containers:
         - name: bfcl-eval
           image: python:3.12-slim

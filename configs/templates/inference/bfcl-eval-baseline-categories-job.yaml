@@ -41,12 +41,17 @@ metadata:
   name: fin-agent-bfcl-eval-qwen3-8b
   namespace: fin-agent
 spec:
-  backoffLimit: 3   # see bfcl-eval-mlflow-checkpoint-job.yaml's identical field for why
+  # backoffLimit 0 + restartPolicy Never, NOT bfcl-eval-job.yaml's retry-and-resume
+  # setup: on BackoffLimitExceeded the job controller deletes the failed pod, and its
+  # logs go with it -- which is exactly what happened the first time this ran, leaving
+  # nothing to debug from. A single failed pod left in Error state is worth more here
+  # than an automatic retry; bfcl generate still resumes from the PVC on a manual rerun.
+  backoffLimit: 0
   template:
     metadata:
       labels: { app: fin-agent-bfcl-eval-qwen3-8b }
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       containers:
         - name: bfcl-eval
           image: python:3.12-slim
