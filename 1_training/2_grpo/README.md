@@ -112,13 +112,30 @@ python train_grpo.py \
   --num-generations 8 --lr 1e-6 --epochs 1
 ```
 
-`--num-generations` (group size `G`) and `--per-device-batch-size` need to be compatible
-per TRL's batching requirements — start from the defaults and consult TRL's own GRPO
-docs before scaling either up.
+## Rollout generation and batch sizing
+
+Rollout generation is what makes a GRPO step expensive: `--num-generations` (8)
+completions per prompt, each up to `--max-completion-length` (512) tokens, decoded
+autoregressively *every step*, through the policy model's own `.generate()`
+(`GRPOConfig.use_vllm` stays at its default of `False`). Routing that through vLLM was
+tried and reverted — colocate mode needs `vllm` importable in the training process, and
+installing it alongside the NGC image's CUDA stack breaks `peft`'s import-time
+`transformer_engine` probe (`undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`)
+before training starts.
+
+**`--per-device-batch-size` cannot be lowered on its own.** TRL derives
+`generation_batch_size = per_device_batch_size × world_size × grad_accum` and rejects any
+value not divisible by `--num-generations`, because a generation batch has to contain
+whole prompt groups (verified against the installed `trl`'s own `GRPOConfig.__post_init__`,
+not assumed). Hence the defaults: batch 4 with `--grad-accum 2` keeps
+`generation_batch_size` at 8 = `G`, halving per-step activation memory without changing
+the effective batch or the group size. Batch 4 with `--grad-accum 1` fails at startup.
+
+The same rule applies to eval with its own group size: `--num-generations-eval` (2, well
+below the training `G`) has to divide `--eval-batch-size` (4). Eval only needs completions
+to score, not a group wide enough to estimate advantages from, so it also runs 4x less
+generation than reusing `G=8` would.
 
 `--mlflow`/`--mlflow-experiment-name`/`--mlflow-tracking-uri` and `--max-steps` mirror
 `1_sft/train_sft.py`'s flags (same MLflowCallback wiring, same "override defaults via
-CLI flags for a smoke run, never by editing the script" pattern) — added specifically to
-support `kube-projects/apps/fin-agent/grpo-job.yaml`'s bounded smoke test. No
-separate vLLM server is needed for rollout generation: `GRPOConfig.use_vllm` defaults to
-`False`, so the policy model generates its own completions in-process via `.generate()`.
+CLI flags for a smoke run, never by editing the script" pattern).

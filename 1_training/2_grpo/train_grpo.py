@@ -139,6 +139,19 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-generations", type=int, default=8, help="Group size G — completions sampled per prompt.")
+    parser.add_argument(
+        "--num-generations-eval",
+        type=int,
+        default=2,
+        help="Group size for the held-out eval loop, kept far below --num-generations (8) "
+        "on purpose: eval only needs completions to score, not a group wide enough to "
+        "estimate advantages from, so 8 rollouts per eval prompt is 4x the generation "
+        "cost for no extra signal. Also load-bearing for startup: GRPOConfig rejects "
+        "any config where per_device_eval_batch_size * world_size isn't divisible by "
+        "this (verified against the installed trl's own __post_init__, not assumed) — "
+        "at the previous default (None -> falls back to num_generations=8) against "
+        "--eval-batch-size 4, that check failed and the run died before training began.",
+    )
     parser.add_argument("--max-completion-length", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
@@ -157,7 +170,27 @@ def main() -> None:
         default=-1,
         help="Overrides --epochs when > 0 — e.g. for a smoke run of a fixed number of steps regardless of dataset size.",
     )
-    parser.add_argument("--per-device-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--per-device-batch-size",
+        type=int,
+        default=4,
+        help="4 (was 8): halves the activations held per step. Cannot be "
+        "lowered on its own -- TRL derives generation_batch_size from "
+        "per_device_batch_size * world_size * --grad-accum and rejects any value not "
+        "divisible by --num-generations, since a generation batch has to hold whole "
+        "prompt groups. 4 with --grad-accum 2 keeps generation_batch_size at 8 (= G), "
+        "so this halves peak memory without changing the effective batch or group size; "
+        "dropping to 4 with --grad-accum 1 fails at startup instead.",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=2,
+        help="Paired with --per-device-batch-size above to keep "
+        "per_device_batch_size * --grad-accum a multiple of --num-generations. Also "
+        "sets steps_per_generation (TRL defaults it to gradient_accumulation_steps), "
+        "i.e. how many optimizer steps reuse one batch of rollouts.",
+    )
     parser.add_argument(
         "--eval-batch-size",
         type=int,
@@ -221,6 +254,7 @@ def main() -> None:
     grpo_config = GRPOConfig(
         output_dir=str(args.output_dir),
         num_generations=args.num_generations,
+        num_generations_eval=args.num_generations_eval,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         beta=args.kl_beta,
@@ -233,6 +267,7 @@ def main() -> None:
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         logging_steps=args.logging_steps,
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,

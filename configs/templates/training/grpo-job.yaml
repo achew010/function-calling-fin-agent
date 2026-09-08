@@ -1,9 +1,10 @@
 # The real GRPO run (1_training/2_grpo/train_grpo.py) — full ToolACE-derived dataset,
-# train_grpo.py's own defaults (num_generations=8, per_device_batch_size=8,
-# max_completion_length=512, 1 epoch, epoch-based save), warm-started from the real SFT
-# checkpoint (sft-job.yaml's output), not grpo-smoke-job.yaml's smoke-test overrides or
-# the raw base model. Run grpo-smoke-job.yaml first to prove the pipeline and the
-# checkpoint handoff both work end-to-end before committing GPU hours to this one.
+# train_grpo.py's own defaults (num_generations=8, per_device_batch_size=4 + grad-accum 2,
+# max_completion_length=512, 1 epoch, held-out eval every 140 steps), warm-started from
+# the real SFT checkpoint (sft-job.yaml's output), not grpo-smoke-job.yaml's smoke-test
+# overrides or the raw base model. Run grpo-smoke-job.yaml first to prove the pipeline
+# and the checkpoint handoff both work end-to-end before committing GPU hours to this
+# one.
 #
 # Not alongside anything in ../inference/ or another file in this directory — this
 # project targets a single GPU running one workload at a time.

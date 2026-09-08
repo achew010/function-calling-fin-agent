@@ -12,8 +12,8 @@
 # policy that rarely produces a valid completion to begin with). max-steps/
 # num-generations/tiny-data below are smoke-test-only overrides passed as explicit CLI
 # flags — train_grpo.py's own defaults are unchanged. Unlike the BFCL eval, no separate
-# vLLM server is needed: GRPOConfig's use_vllm defaults to False, so rollout generation
-# happens via the policy model's own .generate() in-process.
+# vLLM server is needed: rollout generation happens via the policy model's own
+# .generate() in-process.
 #
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job logs to)
