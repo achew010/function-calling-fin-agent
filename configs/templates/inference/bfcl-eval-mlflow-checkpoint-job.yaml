@@ -74,11 +74,29 @@ spec:
             - -c
             - |
               set -e
-              pip install --no-cache-dir mlflow
-              python3 -c "
-              import mlflow
-              mlflow.artifacts.download_artifacts(run_id='__RUN_ID__', artifact_path='model', dst_path='/model')
+              if [ -f /model/config.json ]; then
+                echo "model already staged in /model, skipping download"
+              else
+                pip install --no-cache-dir mlflow
+                python3 -c "
+              import pathlib, mlflow
+              # download_artifacts nests its output under a directory named after
+              # artifact_path -- verified against mlflow directly, not assumed: with
+              # dst_path=/model it returns /model/model, leaving config.json one level
+              # deeper than vLLM looks for it ('Invalid repository ID or local directory
+              # specified: /model'). Flatten it here so /model is the model directory.
+              # Staging *inside* /model keeps this on one filesystem, so the moves below
+              # are renames rather than a second full copy of ~16GB of weights.
+              src = pathlib.Path(mlflow.artifacts.download_artifacts(
+                  run_id='__RUN_ID__', artifact_path='model', dst_path='/model/.staging'))
+              dest = pathlib.Path('/model')
+              for item in src.iterdir():
+                  item.rename(dest / item.name)
               "
+                rm -rf /model/.staging
+              fi
+              # Fail here, loudly, rather than letting vLLM fail less obviously later.
+              test -f /model/config.json || { echo "no config.json in /model after download"; ls -laR /model; exit 1; }
           env:
             - name: MLFLOW_TRACKING_URI
               value: http://mlflow.fin-agent.svc.cluster.local:5000
