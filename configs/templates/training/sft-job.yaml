@@ -40,7 +40,11 @@
 # deliverable of this run and has to survive the pod — unlike the smoke test, where the
 # checkpoint only exists to prove `trainer.save_model()` doesn't crash.
 #
-# Run:    kubectl apply -f configs/templates/training/sft-job.yaml
+# Run (the delete is not optional on a rerun -- a Job's pod template is immutable,
+# so `kubectl apply` over an existing Job of the same name fails with
+# "spec.template: Invalid value: ... field is immutable"):
+#         kubectl -n fin-agent delete job fin-agent-sft --ignore-not-found --wait=true
+#         kubectl apply -f configs/templates/training/sft-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-sft -f
 # Progress: MLflow (port-forward per setup/mlflow.yaml's header) — logging-steps below
 #           and train_sft.py's FunctionCallEvalCallback report loss/eval metrics per step.

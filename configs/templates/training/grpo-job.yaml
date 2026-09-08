@@ -41,7 +41,11 @@
 # tokens) is typically much slower per-example than SFT's single forward/backward pass.
 # Tighten this once a real run's actual duration is known.
 #
-# Run:    kubectl apply -f configs/templates/training/grpo-job.yaml
+# Run (the delete is not optional on a rerun -- a Job's pod template is immutable,
+# so `kubectl apply` over an existing Job of the same name fails with
+# "spec.template: Invalid value: ... field is immutable"):
+#         kubectl -n fin-agent delete job fin-agent-grpo --ignore-not-found --wait=true
+#         kubectl apply -f configs/templates/training/grpo-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo -f
 # Checkpoint: /var/lib/fin-agent/checkpoints/grpo on the node afterward.
 # Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place):

@@ -44,7 +44,11 @@
 # ephemeral storage: grpo-smoke-job.yaml and a BFCL smoke eval both chain off this
 # checkpoint as their starting model, so it has to survive this pod exiting.
 #
-# Run:    kubectl apply -f configs/templates/training/sft-smoke-job.yaml
+# Run (the delete is not optional on a rerun -- a Job's pod template is immutable,
+# so `kubectl apply` over an existing Job of the same name fails with
+# "spec.template: Invalid value: ... field is immutable"):
+#         kubectl -n fin-agent delete job fin-agent-sft-smoke --ignore-not-found --wait=true
+#         kubectl apply -f configs/templates/training/sft-smoke-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-sft-smoke -f
 # Clean up (Jobs don't self-delete; the checkpoint on hostPath is left in place since
 # grpo-smoke-job.yaml and the BFCL smoke eval depend on it):

@@ -44,7 +44,11 @@
 #     --from-file=train_grpo.py=1_training/2_grpo/train_grpo.py \
 #     --from-file=tox.ini=tox.ini
 #
-# Run:    kubectl apply -f configs/templates/training/grpo-smoke-job.yaml
+# Run (the delete is not optional on a rerun -- a Job's pod template is immutable,
+# so `kubectl apply` over an existing Job of the same name fails with
+# "spec.template: Invalid value: ... field is immutable"):
+#         kubectl -n fin-agent delete job fin-agent-grpo-smoke --ignore-not-found --wait=true
+#         kubectl apply -f configs/templates/training/grpo-smoke-job.yaml
 # Logs:   kubectl -n fin-agent logs -l app=fin-agent-grpo-smoke -f
 # Clean up (Jobs don't self-delete):
 #   kubectl -n fin-agent delete job fin-agent-grpo-smoke
