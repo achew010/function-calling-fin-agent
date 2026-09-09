@@ -93,10 +93,23 @@ def main() -> None:
 
     dst_dir = args.dst_dir or os.path.expanduser(f"~/.cache/fin-agent/mlflow-models/{args.run_id}")
     model_dir = os.path.join(dst_dir, args.artifact_path)
+    # Written only after a fully successful download/copy -- NOT the same check as
+    # "does config.json exist", which a partial copy (e.g. one file mid-copytree
+    # hitting a permission error, see the fallback branch below) can satisfy while
+    # still missing the actual weight files. Confirmed for real: a crashed copytree
+    # left config.json in place but not model.safetensors, and a config.json-only
+    # check on the next run wrongly called that "already downloaded" and sent vLLM at
+    # an incomplete directory ("Cannot find any model weights").
+    sentinel = os.path.join(model_dir, ".fin_agent_download_complete")
 
-    if os.path.exists(os.path.join(model_dir, "config.json")):
+    if os.path.exists(sentinel):
         print(f"[serve_mlflow_checkpoint] {model_dir} already downloaded, skipping fetch", file=sys.stderr)
     else:
+        # Clear any stale partial state before retrying, whichever path below actually
+        # runs -- copytree (and download_artifacts) don't guarantee a clean directory
+        # to write into, and we specifically got here because a previous attempt may
+        # have left one half-populated.
+        shutil.rmtree(model_dir, ignore_errors=True)
         mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         print(f"[serve_mlflow_checkpoint] downloading run {args.run_id}'s '{args.artifact_path}' artifact ...", file=sys.stderr)
         try:
@@ -125,6 +138,11 @@ def main() -> None:
                 file=sys.stderr,
             )
             shutil.copytree(host_path, model_dir)
+        # Only reached if the try block (or its except fallback) completed without
+        # raising -- an interrupted copy leaves no sentinel, so the next run correctly
+        # treats it as incomplete and retries from a clean directory instead of
+        # trusting a partial one.
+        open(sentinel, "w").close()
 
     if not os.path.exists(os.path.join(model_dir, "config.json")):
         raise SystemExit(
