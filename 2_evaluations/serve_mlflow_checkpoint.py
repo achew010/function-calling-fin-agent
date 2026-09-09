@@ -15,9 +15,41 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 
 import mlflow
+
+# configs/setup/mlflow.yaml deliberately configures this project's MLflow with a bare
+# local-path artifact root (--default-artifact-root /data/artifacts), not the
+# HTTP-proxied mlflow-artifacts:/ scheme -- see that file's own header for why
+# (sidesteps a proxy-scheme resolution bug by having every pod mount the identical PVC
+# at the identical in-container path). That means every run's artifact_uri looks like
+# /data/artifacts/<experiment_id>/<run_id>/artifacts -- resolvable by
+# mlflow.artifacts.download_artifacts() only from *inside* that same mount (any pod),
+# never from a bare host, which has no /data/artifacts directory at all (confirmed for
+# real: MlflowException "Failed to download artifacts from path 'model', please ensure
+# that the path is correct" running this from outside the cluster). The same
+# setup/mlflow.yaml PersistentVolume also names where that PVC's data really lives on
+# the node's own disk -- so when the normal client-side download fails this specific
+# way, read directly from there instead of going through mlflow's (here, unusable)
+# artifact-repository machinery.
+INCLUSTER_ARTIFACT_ROOT = "/data/artifacts"
+HOST_ARTIFACT_ROOT = "/var/lib/fin-agent/mlflow-artifacts"
+
+
+def _hostpath_fallback(run_id: str, artifact_path: str) -> str | None:
+    """The real, on-disk directory for one run's artifact, if this project's known
+    in-cluster-path -> hostPath mapping applies -- None if the run's own artifact_uri
+    doesn't match that convention at all (a different/misconfigured MLflow instance),
+    so callers don't misapply a fix that's specific to this project's setup.
+    """
+    run = mlflow.get_run(run_id)
+    artifact_uri = run.info.artifact_uri
+    if not artifact_uri.startswith(INCLUSTER_ARTIFACT_ROOT):
+        return None
+    host_run_dir = HOST_ARTIFACT_ROOT + artifact_uri[len(INCLUSTER_ARTIFACT_ROOT) :]
+    return os.path.join(host_run_dir, artifact_path)
 
 
 def main() -> None:
@@ -67,19 +99,32 @@ def main() -> None:
     else:
         mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         print(f"[serve_mlflow_checkpoint] downloading run {args.run_id}'s '{args.artifact_path}' artifact ...", file=sys.stderr)
-        downloaded = mlflow.artifacts.download_artifacts(
-            run_id=args.run_id, artifact_path=args.artifact_path, dst_path=dst_dir
-        )
-        # download_artifacts nests its output under a directory named after
-        # artifact_path -- verified directly against mlflow, not assumed (same finding
-        # documented in vllm-grpo-mtp.yaml's initContainer): dst_path=X,
-        # artifact_path="model" returns X/model, i.e. exactly model_dir above. This
-        # assert exists to catch mlflow ever changing that behavior loudly, rather than
-        # silently pointing vllm at the wrong directory.
-        assert downloaded == model_dir, (
-            f"expected mlflow to place the download at {model_dir}, got {downloaded} -- "
-            "mlflow.artifacts.download_artifacts' nesting behavior may have changed."
-        )
+        try:
+            downloaded = mlflow.artifacts.download_artifacts(
+                run_id=args.run_id, artifact_path=args.artifact_path, dst_path=dst_dir
+            )
+            # download_artifacts nests its output under a directory named after
+            # artifact_path -- verified directly against mlflow, not assumed (same
+            # finding documented in vllm-grpo-mtp.yaml's initContainer): dst_path=X,
+            # artifact_path="model" returns X/model, i.e. exactly model_dir above.
+            # This assert exists to catch mlflow ever changing that behavior loudly,
+            # rather than silently pointing vllm at the wrong directory.
+            assert downloaded == model_dir, (
+                f"expected mlflow to place the download at {model_dir}, got {downloaded} -- "
+                "mlflow.artifacts.download_artifacts' nesting behavior may have changed."
+            )
+        except Exception as e:
+            host_path = _hostpath_fallback(args.run_id, args.artifact_path)
+            if host_path is None or not os.path.isdir(host_path):
+                raise
+            print(
+                f"[serve_mlflow_checkpoint] normal download failed ({e}); this MLflow "
+                f"instance uses a bare local-path artifact store (see this file's "
+                f"INCLUSTER_ARTIFACT_ROOT comment) -- falling back to reading directly "
+                f"from {host_path}",
+                file=sys.stderr,
+            )
+            shutil.copytree(host_path, model_dir)
 
     if not os.path.exists(os.path.join(model_dir, "config.json")):
         raise SystemExit(
