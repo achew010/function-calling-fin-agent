@@ -62,7 +62,7 @@ spec:
               exec vllm serve /model
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
-              --max-model-len 32768
+              --max-model-len 40960
               --speculative-config '{"method": "mtp", "num_speculative_tokens": 4}'
               --guided-decoding-backend xgrammar
               --host 0.0.0.0 --port 8000

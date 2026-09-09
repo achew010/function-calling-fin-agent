@@ -44,6 +44,24 @@ spec:
           # headroom for concurrent requests without the per-request ceiling eating
           # nearly all of it. An H100 has plenty of room to raise this further if you
           # want more concurrency headroom.
+          #
+          # Bumped again, 32768 -> 40960 (Qwen3-8B's actual native max, matching the
+          # note above): BFCL's own OSS handler doesn't ask the server what its real
+          # limit is -- base_oss_handler.py reads max_context_length straight off the
+          # model's HF config (config.max_position_embeddings, 40960) and sizes each
+          # request's max_tokens against THAT, with no idea what --max-model-len was
+          # actually set to. At 32768, any prompt+max_tokens combination between 32768
+          # and 40960 (routine for tool-heavy categories like live_multiple/
+          # live_irrelevance, which list many candidate functions) gets a real
+          # context-length rejection from vLLM -- and BFCL's own per-case handler
+          # (_multi_threaded_inference) catches that silently and writes "Error during
+          # inference: ..." as the literal model response instead of surfacing it, so
+          # the run "completes" abnormally fast with near-zero scores and no visible
+          # error unless you grep the result files for that string. Not an
+          # enable_thinking issue -- verified against bfcl_eval's source that this OSS
+          # Prompt-style handler calls the raw /v1/completions endpoint with a
+          # hand-built prompt, never /v1/chat/completions, so no chat template (and
+          # therefore no enable_thinking) is ever involved in this path at all.
           command:
             - sh
             - -c
@@ -51,7 +69,7 @@ spec:
               exec vllm serve Qwen/Qwen3-8B
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
-              --max-model-len 32768
+              --max-model-len 40960
               --host 0.0.0.0 --port 8000
           env:
             - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN

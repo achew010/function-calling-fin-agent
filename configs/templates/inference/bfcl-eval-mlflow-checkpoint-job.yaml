@@ -112,6 +112,15 @@ spec:
           # MODEL_CONFIG_MAPPING lookup (keyed on model id string, not on what's
           # actually being served) resolving the same prompt-formatting/response-
           # parsing handler as the real baseline.
+          #
+          # --max-model-len 40960, matching Qwen3-8B's real native context (see
+          # ../inference/vllm-qwen3-8b.yaml's identical comment for the full story):
+          # BFCL's own OSS handler sizes request max_tokens off the model's HF config
+          # (40960), not off whatever --max-model-len the server was actually given, so
+          # a lower cap here causes silent per-case context-length rejections that
+          # BFCL's own error handling swallows and writes into results as literal
+          # "Error during inference: ..." text -- a run that "completes" abnormally
+          # fast with near-zero scores and no visible error unless you grep for it.
           command:
             - sh
             - -c
@@ -119,7 +128,7 @@ spec:
               exec vllm serve /model
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
-              --max-model-len 32768
+              --max-model-len 40960
               --host 0.0.0.0 --port 8000
           env:
             - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN

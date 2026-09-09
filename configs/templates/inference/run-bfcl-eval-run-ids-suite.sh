@@ -85,7 +85,17 @@ run_mlflow_checkpoint() {
   kubectl -n "${NAMESPACE}" rollout status "deploy/fin-agent-vllm-${name}" --timeout=900s
   kubectl -n "${NAMESPACE}" wait --for=condition=complete "job/fin-agent-bfcl-eval-${name}" --timeout="${WAIT_TIMEOUT}"
   kubectl -n "${NAMESPACE}" logs -l "app=fin-agent-bfcl-eval-${name}" --tail=20
-  echo "${rendered}" | kubectl delete -f - --ignore-not-found
+  # Deployment/Service only -- NOT the whole rendered manifest, which also contains the
+  # fin-agent-bfcl-mlflow-results PVC. `kubectl delete -f -` on the full thing deletes
+  # results/scores generated this run along with the server, same mistake
+  # bfcl-eval-job.yaml's own header explicitly calls out avoiding ("The PVC is
+  # deliberately not deleted here so a finished run's results survive"). Losing them
+  # here is worse than usual: a bug fix that only affects the *logging* step (e.g. the
+  # read_category_summaries model-path bug) would otherwise force a full, expensive
+  # regeneration to recover, when a quick re-score of already-generated results would
+  # have done it in about a minute.
+  kubectl -n "${NAMESPACE}" delete deployment "fin-agent-vllm-${name}" --ignore-not-found
+  kubectl -n "${NAMESPACE}" delete service "fin-agent-vllm-${name}" --ignore-not-found
 }
 
 for model in ${MODELS}; do

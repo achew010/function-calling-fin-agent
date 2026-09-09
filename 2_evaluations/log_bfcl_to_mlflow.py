@@ -73,16 +73,25 @@ LEADERBOARD_QWEN3_8B_REFERENCE = {
 
 
 def read_category_summaries(score_dir: Path, model: str) -> dict[str, dict]:
-    model_dir = score_dir / model
+    # BFCL flattens model ids when naming result/score directories. Using the raw
+    # Hugging Face id here creates score/Qwen/Qwen3-8B, which never exists; the actual
+    # directory is score/Qwen_Qwen3-8B.
+    model_dir = score_dir / model.replace("/", "_")
     summaries: dict[str, dict] = {}
     if not model_dir.exists():
-        return summaries
+        existing = sorted(p.name for p in score_dir.iterdir()) if score_dir.exists() else []
+        raise FileNotFoundError(
+            f"BFCL produced no score directory at {model_dir}; "
+            f"{score_dir} contains: {existing}"
+        )
     for f in sorted(model_dir.glob("BFCL_v3_*_score.json")):
         category = f.stem.removeprefix("BFCL_v3_").removesuffix("_score")
         with f.open() as fh:
             first_line = fh.readline()
         if first_line:
             summaries[category] = json.loads(first_line)
+    if not summaries:
+        raise RuntimeError(f"BFCL produced no category summaries in {model_dir}")
     return summaries
 
 
@@ -215,6 +224,11 @@ def main() -> None:
         evaluator.compute_metrics(predictions)
 
         summaries = read_category_summaries(score_dir, args.model)
+        missing_categories = set(eval_dataset) - set(summaries)
+        if missing_categories:
+            raise RuntimeError(
+                "BFCL did not produce scores for: " + ", ".join(sorted(missing_categories))
+            )
         print(json.dumps(summaries, indent=2))
 
         for category, summary in summaries.items():
