@@ -32,6 +32,20 @@ Each ToolACE conversation is converted into the base model's chat template: `sys
 turns carry the tool definitions, and `user`/`assistant`/`tool` turns pass through
 unmodified.
 
+Each assistant turn becomes one **prompt/completion** training row. Its prompt contains
+the system message and all preceding turns; its completion contains only that assistant
+response plus the end-of-turn marker. `completion_only_loss=True` masks the entire
+prompt, including earlier assistant turns and tool responses, as well as padding.
+No-call responses and clarification questions remain supervised assistant targets.
+The prompt uses `enable_thinking=False`, exactly as generation evaluation does; Qwen3's
+empty think block belongs to this supplied prefix, not the supervised completion.
+
+This replaces full-conversation language-model loss. With the current local data,
+9,515 training conversations become 11,793 assistant targets (validation: 529 → 651).
+At batch 16 with accumulation 1 on one GPU, one epoch is now approximately 738 updates
+instead of 595. Loss and token accuracy now measure assistant completions, so their
+absolute values are not directly comparable to previous full-conversation runs.
+
 **Assistant call turns keep ToolACE's native `[Name(arg=val)]` syntax** — not
 re-rendered as JSON. An earlier version did convert them, which was wrong on two counts,
 both confirmed against a served checkpoint: it contradicted the data's own system
@@ -62,6 +76,11 @@ workflow, `--data-filter` can restrict a training run to one workflow's examples
 produce a second adapter without duplicating the base model.
 
 ## Validation metrics
+
+`eval_on_start=True` evaluates the initial policy at **step 0**, before any optimizer
+update. It logs both completion-only validation loss and the usual generation metrics
+on the same validation conversations used later in training, including when MLflow is enabled.
+This baseline is a measurement, not a saved candidate for best-checkpoint selection.
 
 Beyond `eval_loss`, `train_sft.py` reports generation-based function-calling metrics
 during validation (`metrics.py`, wired in via `FunctionCallEvalCallback`) — chosen after
@@ -97,15 +116,44 @@ call-name-keyed and order-independent everywhere else in this project.
 teacher-forced (predicts the next token given the *correct* prefix so far), which
 systematically looks more accurate than real generation — it can't surface the
 compounding errors a model makes decoding on its own. `FunctionCallEvalCallback` runs
-real `model.generate()` (greedy) on a small, fixed subsample of the validation set
-(`--metrics-eval-samples`, default 50) so these numbers mean what
-`2_evaluations/run_internal_eval.py`'s numbers mean — deliberately a subsample, not the
-full val set, since generation is far more expensive than the forward pass Trainer's own
-loss-eval uses. Logs the full `metrics.py` breakdown each eval round (tool-selection
+real `model.generate()` (greedy) on **all validation conversations** by default
+(`--metrics-eval-samples 0`). A positive value explicitly selects a fixed subset for
+smoke tests. The local validation split has 529 conversations, 651 assistant turns,
+and 32 multi-turn conversations. Full generation evaluation takes substantially longer
+than the old 50-conversation sample. Logs the full `metrics.py` breakdown each eval round (tool-selection
 accuracy, param value/type accuracy, hallucination rate, per-error-type rates), not just
 the single `eval_fc_call_correctness` scalar `metric_for_best_model` uses — useful for
 telling *which* kind of error is driving a change in that scalar rather than just that
 one happened.
+
+Each evaluation saves `validation_predictions/step-NNNNNN.json` inside the output
+directory, with conversation IDs, per-turn contexts, expected calls, predictions,
+scores, generated-token counts, token-limit flags, and dataset/scorer/template hashes.
+The report is also uploaded to MLflow immediately when `--mlflow` is enabled.
+`eval_n_conversations` and `eval_n_trajectories` expose the sample sizes on the dashboard.
+
+Every candidate is compared with its stage's step-zero baseline using 10,000 paired
+bootstrap draws (seed 0), resampling whole conversations with replacement. Reports
+contain candidate-minus-baseline differences and percentile 95% confidence intervals
+for full-call, refusal, and trajectory accuracy. Deltas and interval bounds are also
+logged as `eval_vs_baseline_*` metrics. Call/refusal rates are weighted by turns;
+trajectory rates are weighted by conversations. Replicates with no eligible cases
+are omitted for that metric and their valid count is reported.
+
+These are pointwise intervals, not adjusted for selecting the best of many checkpoints.
+Trajectory accuracy still uses ground-truth history, not a live agent rollout. Use
+validation for checkpoint selection and reserve `test.jsonl` for the final comparison;
+training callbacks only read the supplied validation file.
+
+Compare any two saved reports without generating again (from the repository root):
+
+```bash
+python 2_evaluations/compare_validation.py \
+  --baseline checkpoints/sft/validation_predictions/step-000000.json \
+  --candidate checkpoints/sft/validation_predictions/step-000140.json
+```
+
+It rejects mismatched datasets, scorers, generation settings, or conversation/turn alignment.
 
 Verified without a GPU the same way the rest of this project has been: fed a "perfect"
 prediction (the exact ground-truth call, or a plausible refusal) through `metrics.py`
@@ -129,8 +177,17 @@ python train_sft.py \
   --val-file ../../0_data/data/val.jsonl \
   --output-dir checkpoints/adapter-general \
   --epochs 1 --lr 2e-4 --lora-r 16 --lora-alpha 32 \
-  --metrics-eval-samples 50 \
+  --metrics-eval-samples 0 \
   --mlflow --mlflow-experiment-name fin-agent-sft
 ```
 
 This checkpoint is the starting policy for `../2_grpo/`.
+
+## Tests
+
+Run `tox -e sft-tests`. These CPU-only tests cover JSON loading, message conversion,
+per-turn expansion, history isolation, call-type filtering, native call preservation,
+no-call targets, non-thinking prompt boundaries, and invalid/empty inputs. They also
+exercise TRL's real preprocessing and collator to verify prompt/padding masks and a
+tiny randomly initialized Qwen model to verify step-zero evaluation before training.
+No pretrained model download is required.

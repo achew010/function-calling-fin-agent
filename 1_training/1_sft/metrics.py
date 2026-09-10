@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+import random
 from collections import Counter
 from typing import Any
 
@@ -194,6 +195,8 @@ def aggregate_metrics(scored_examples: list[tuple[str, list[dict[str, Any]]]]) -
     trajectory_correct = sum(1 for results in trajectories if all(_instance_correct(r) for r in results))
 
     metrics: dict[str, float | None] = {
+        "n_conversations": len(scored_examples),
+        "n_trajectories": len(trajectories),
         "n_instances": n,
         "n_call_cases": len(call_results),
         "n_refusal_cases": len(refusal_results),
@@ -213,3 +216,93 @@ def aggregate_metrics(scored_examples: list[tuple[str, list[dict[str, Any]]]]) -
         metrics[f"error_rate_{error_type}"] = (error_counts.get(error_type, 0) / n) if n else None
 
     return {k: v for k, v in metrics.items() if v is not None}
+
+
+def compare_validation_reports(baseline: dict, candidate: dict, n_bootstrap: int = 10000, seed: int = 0) -> dict:
+    """Paired percentile bootstrap of candidate-minus-baseline accuracy.
+
+    Resample conversations with replacement, retaining all their turns and pairing
+    identical IDs in both runs. Call/refusal accuracy remains turn-weighted; trajectory
+    accuracy remains conversation-weighted. These are pointwise, not selection-adjusted,
+    intervals. A replicate with no eligible denominator is omitted for that metric.
+    """
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
+    for key in ("schema_version", "dataset_sha256", "scorer_sha256", "generation"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"Incompatible validation reports: {key}")
+
+    def index(report):
+        rows = report["conversations"]
+        indexed = {row["conversation_id"]: row for row in rows}
+        if not rows or len(indexed) != len(rows):
+            raise ValueError("Conversation IDs must be nonempty and unique")
+        return indexed
+
+    left, right = index(baseline), index(candidate)
+    if left.keys() != right.keys():
+        raise ValueError("Validation conversation IDs differ")
+    stats = []
+    for cid in sorted(left):
+        a, b = left[cid], right[cid]
+        if a["call_type"] != b["call_type"] or len(a["turns"]) != len(b["turns"]):
+            raise ValueError(f"Conversation structure differs: {cid}")
+        for x, y in zip(a["turns"], b["turns"]):
+            for key in ("turn_index", "expected_calls", "context"):
+                if x[key] != y[key]:
+                    raise ValueError(f"Turn alignment differs: {cid}/{key}")
+            if x["score"]["is_call_case"] != y["score"]["is_call_case"]:
+                raise ValueError(f"Call-case labels differ: {cid}")
+
+        def counts(row):
+            scores = [t["score"] for t in row["turns"]]
+            calls = [s for s in scores if s["is_call_case"]]
+            refusals = [s for s in scores if not s["is_call_case"]]
+            trajectory = row["call_type"] == "multi_turn"
+            return [
+                (sum(s.get("param_correct", False) for s in calls), len(calls)),
+                (sum(s.get("refusal_correct", False) for s in refusals), len(refusals)),
+                (int(trajectory and bool(scores) and all(_instance_correct(s) for s in scores)), int(trajectory)),
+            ]
+        stats.append((counts(a), counts(b)))
+
+    names = ["full_call_accuracy", "refusal_accuracy", "trajectory_accuracy"]
+    def rates(indices, metric):
+        an = ad = bn = bd = 0
+        for i in indices:
+            a, b = stats[i]
+            an += a[metric][0]
+            ad += a[metric][1]
+            bn += b[metric][0]
+            bd += b[metric][1]
+        return (an / ad, bn / bd) if ad and bd else None
+
+    draws = [[] for _ in names]
+    rng = random.Random(seed)
+    for _ in range(n_bootstrap):
+        indices = rng.choices(range(len(stats)), k=len(stats))
+        for m in range(len(names)):
+            pair = rates(indices, m)
+            if pair is not None:
+                draws[m].append(pair[1] - pair[0])
+
+    def quantile(values, q):
+        pos = (len(values) - 1) * q
+        low = int(pos)
+        high = min(low + 1, len(values) - 1)
+        return values[low] + (values[high] - values[low]) * (pos - low)
+
+    result = {"baseline_step": baseline["step"], "candidate_step": candidate["step"],
+              "n_conversations": len(stats), "n_bootstrap": n_bootstrap, "seed": seed,
+              "method": "paired conversation-cluster percentile bootstrap; pointwise 95% CI",
+              "metrics": {}}
+    for m, name in enumerate(names):
+        pair = rates(range(len(stats)), m)
+        if pair is not None and draws[m]:
+            values = sorted(draws[m])
+            result["metrics"][name] = {
+                "baseline": pair[0], "candidate": pair[1], "delta": pair[1] - pair[0],
+                "ci_low": quantile(values, 0.025), "ci_high": quantile(values, 0.975),
+                "valid_replicates": len(values),
+            }
+    return result

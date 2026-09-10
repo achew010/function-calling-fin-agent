@@ -223,9 +223,8 @@ def main() -> None:
     parser.add_argument(
         "--metrics-eval-samples",
         type=int,
-        default=50,
-        help="Validation examples FunctionCallEvalCallback runs real generation-based "
-        "metrics on per eval -- see train_sft.py's identical flag.",
+        default=0,
+        help="Validation conversations for generation metrics: 0 uses the full split; positive values select a fixed smoke-test subset.",
     )
     parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
     parser.add_argument("--lora-r", type=int, default=16)
@@ -271,6 +270,7 @@ def main() -> None:
         logging_steps=args.logging_steps,
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
+        eval_on_start=True,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         # Mirrors train_sft.py: reload the checkpoint with the best real,
@@ -288,6 +288,7 @@ def main() -> None:
         args.val_file,
         eval_samples=args.metrics_eval_samples,
         max_new_tokens=args.metrics_max_new_tokens,
+        log_artifacts=args.mlflow,
     )
 
     trainer = GRPOTrainer(

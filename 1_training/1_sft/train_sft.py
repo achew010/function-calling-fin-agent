@@ -5,12 +5,13 @@ baseline model. Keeping these in sync matters: a baseline-vs-fine-tuned comparis
 only meaningful if both measurements are the same base checkpoint, not just the same
 size class.
 
-Note on Qwen3's "thinking" mode: it's a hybrid reasoning model that can emit
-<think>...</think> before its answer. Training data here has no reasoning_content, so
-the chat template renders assistant turns with an *empty* think block
-(<think>\\n\\n</think>\\n\\n) rather than none at all — this is expected and desired, not
-a bug: it's what teaches the model to reproduce the same immediate-answer, non-thinking
-pattern used at inference (see the enable_thinking=False notes in 2_evaluations/).
+Each assistant turn is a separate prompt/completion example. The prompt contains all
+preceding conversation history; only the target assistant response and its end-of-turn
+marker contribute to the loss. Qwen3's empty think block is supplied in the prompt
+with enable_thinking=False, matching generation-based evaluation and inference.
+
+Evaluation runs at step zero before the first optimizer update, then at the configured
+cadence. Both the teacher-forced loss and generation-based metrics include this baseline.
 
 Saves a merged, standalone model to --output-dir (LoRA folded into the base weights via
 merge_and_unload(), not an adapter-only checkpoint) — see main()'s comment at the save
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -49,7 +51,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-from metrics import aggregate_metrics, score_detailed
+from metrics import aggregate_metrics, compare_validation_reports, score_detailed
 
 CALL_TYPES = ["single", "parallel", "multi_turn", "no_call"]
 
@@ -85,13 +87,47 @@ def build_dataset(path: Path, tokenizer, data_filter: str | None) -> Dataset:
     examples = load_examples(path)
     if data_filter:
         examples = [ex for ex in examples if ex.get("call_type") == data_filter]
-    texts = [
-        tokenizer.apply_chat_template(
-            to_messages(ex), tokenize=False, add_generation_prompt=False
-        )
-        for ex in examples
-    ]
-    return Dataset.from_dict({"text": texts})
+    # One target assistant turn per row. Earlier assistant/tool turns remain in the
+    # prompt as context, but only this turn contributes to the loss. Render here so
+    # Qwen's non-thinking generation prefix is identical to the evaluation prefix;
+    # this also avoids depending on a chat template with assistant-mask support.
+    prompts, completions = [], []
+    for example_index, ex in enumerate(examples):
+        messages = to_messages(ex)
+        for turn_index, message in enumerate(messages):
+            if message["role"] != "assistant":
+                continue
+            prompt = tokenizer.apply_chat_template(
+                messages[:turn_index],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            full_text = tokenizer.apply_chat_template(
+                messages[: turn_index + 1],
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,
+            )
+            # Fail rather than silently supervise part of the prompt if a different
+            # model's chat template renders history differently with a target added.
+            if not full_text.startswith(prompt) or len(full_text) == len(prompt):
+                raise ValueError(
+                    f"{path}: example {example_index}, turn {turn_index}: "
+                    "chat template must render a nonempty completion after the "
+                    "non-thinking generation prefix"
+                )
+            prompts.append(prompt)
+            completion = full_text[len(prompt) :]
+            # Qwen's template leaves a newline after <|im_end|>. TRL appends EOS
+            # unless the string ends with eos_token, which otherwise creates a
+            # second end marker. Strip only whitespace AFTER an existing EOS.
+            if tokenizer.eos_token and completion.rstrip().endswith(tokenizer.eos_token):
+                completion = completion.rstrip()
+            completions.append(completion)
+    if not prompts:
+        raise ValueError(f"{path}: no assistant targets after filtering")
+    return Dataset.from_dict({"prompt": prompts, "completion": completions})
 
 
 class FunctionCallEvalCallback(TrainerCallback):
@@ -103,11 +139,10 @@ class FunctionCallEvalCallback(TrainerCallback):
     ground-truth prefix), which systematically looks more accurate than real
     generation — it can't surface the compounding errors a model makes decoding on its
     own. To report numbers that mean what 2_evaluations/run_internal_eval.py's numbers
-    mean, this callback runs real `model.generate()` (greedy) on a small, fixed
-    subsample of the validation set — intentionally not the full eval set, and
-    intentionally not on every batch, since generation is far more expensive than the
-    forward pass Trainer's own eval loop uses. Keep `eval_samples` small (tens, not
-    hundreds).
+    mean, this callback runs real `model.generate()` (greedy) on the full validation
+    set by default. Positive eval_samples opts into a fixed subset for smoke tests.
+    Per-turn predictions are saved at every evaluation; subsequent evaluations are
+    compared with step zero using a paired bootstrap clustered by conversation.
 
     Needs `self.trainer` set after Trainer construction (see main()): Trainer.evaluate()
     calls `self.log(output.metrics)` *before* dispatching `on_evaluate` to callbacks
@@ -128,12 +163,25 @@ class FunctionCallEvalCallback(TrainerCallback):
     """
 
     def __init__(
-        self, val_file: Path, eval_samples: int = 30, max_new_tokens: int = 256, seed: int = 0
+        self, val_file: Path, eval_samples: int = 0, max_new_tokens: int = 256, seed: int = 0,
+        log_artifacts: bool = False,
     ) -> None:
+        if eval_samples < 0:
+            raise ValueError("eval_samples must be nonnegative (0 means full validation)")
         examples = load_examples(val_file)
+        if not examples:
+            raise ValueError("Validation dataset is empty")
+        self.dataset_sha256 = hashlib.sha256(val_file.read_bytes()).hexdigest()
+        self.scorer_sha256 = hashlib.sha256(b"\n".join(
+            Path(sys.modules[name].__file__).read_bytes()
+            for name in ("metrics", "run_internal_eval", "prepare_dataset")
+        )).hexdigest()
         rng = random.Random(seed)
-        self.examples = rng.sample(examples, min(eval_samples, len(examples)))
+        indexed = list(enumerate(examples))
+        self.examples = rng.sample(indexed, min(eval_samples, len(indexed))) if eval_samples else indexed
         self.max_new_tokens = max_new_tokens
+        self.log_artifacts = log_artifacts
+        self.baseline_report = None
         self.trainer: Any = None  # set by main() after Trainer construction
 
     def on_evaluate(self, args, state, control, metrics, model=None, processing_class=None, **kwargs):
@@ -143,10 +191,12 @@ class FunctionCallEvalCallback(TrainerCallback):
         was_training = model.training
         model.eval()
         scored_examples: list[tuple[str, list[dict[str, Any]]]] = []
+        conversations = []
         with torch.no_grad():
-            for ex in self.examples:
+            for conversation_id, ex in self.examples:
                 results = []
-                for instance in build_eval_instances(ex):
+                turns = []
+                for turn_index, instance in enumerate(build_eval_instances(ex)):
                     prompt = tokenizer.apply_chat_template(
                         instance["context"],
                         tokenize=False,
@@ -171,12 +221,47 @@ class FunctionCallEvalCallback(TrainerCallback):
                     )
                     completion_ids = output_ids[0][inputs["input_ids"].shape[1] :]
                     completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-                    results.append(score_detailed(instance, completion_text, parse_prediction, normalize_calls))
+                    score = score_detailed(instance, completion_text, parse_prediction, normalize_calls)
+                    results.append(score)
+                    turns.append({
+                        "turn_index": turn_index, "context": instance["context"],
+                        "expected_calls": instance["expected_calls"],
+                        "tool_names": sorted(instance["tool_names"]),
+                        "prediction": completion_text, "score": score,
+                        "generated_tokens": len(completion_ids),
+                        "reached_token_limit": len(completion_ids) >= self.max_new_tokens,
+                    })
                 scored_examples.append((ex["call_type"], results))
+                conversations.append({"conversation_id": conversation_id,
+                                      "call_type": ex["call_type"], "turns": turns})
         if was_training:
             model.train()
 
         detailed = aggregate_metrics(scored_examples)
+        report = {
+            "schema_version": 1, "dataset_sha256": self.dataset_sha256,
+            "scorer_sha256": self.scorer_sha256,
+            "step": state.global_step,
+            "generation": {"do_sample": False, "max_new_tokens": self.max_new_tokens,
+                           "enable_thinking": False,
+                           "chat_template_sha256": hashlib.sha256(
+                               json.dumps(tokenizer.chat_template, sort_keys=True).encode()).hexdigest()},
+            "metrics": detailed, "conversations": conversations,
+        }
+        if state.global_step == 0:
+            self.baseline_report = report
+        elif self.baseline_report is not None:
+            report["comparison_to_baseline"] = compare_validation_reports(self.baseline_report, report)
+        if args.process_index == 0:
+            output = Path(args.output_dir) / "validation_predictions"
+            output.mkdir(parents=True, exist_ok=True)
+            path = output / f"step-{state.global_step:06d}.json"
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(report, indent=2))
+            temporary.replace(path)
+            if self.log_artifacts:
+                import mlflow
+                mlflow.log_artifact(str(path), artifact_path="validation_predictions")
         # full_call_accuracy is the same computation call_correctness() used to do
         # separately (see metrics.py) -- reading it off the aggregate dict instead
         # keeps there being exactly one place that logic lives.
@@ -196,6 +281,11 @@ class FunctionCallEvalCallback(TrainerCallback):
             {
                 "eval_fc_call_correctness": metrics["eval_fc_call_correctness"],
                 **{f"eval_{k}": v for k, v in detailed.items() if k != "full_call_accuracy"},
+                **{
+                    f"eval_vs_baseline_{name}_{key}": values[key]
+                    for name, values in report.get("comparison_to_baseline", {}).get("metrics", {}).items()
+                    for key in ("delta", "ci_low", "ci_high")
+                },
             }
         )
 
@@ -317,8 +407,8 @@ def main() -> None:
     parser.add_argument(
         "--metrics-eval-samples",
         type=int,
-        default=50,
-        help="Validation examples to run real generation-based metrics on per eval (see FunctionCallEvalCallback) — kept small since generation is expensive (unbatched, one model.generate() call per example). Bumped 30->50 for a less noisy eval_fc_call_correctness/error-rate signal.",
+        default=0,
+        help="Validation conversations for generation metrics: 0 uses the full split (default); a positive number selects a fixed subset for smoke tests.",
     )
     parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
     parser.add_argument(
@@ -375,6 +465,9 @@ def main() -> None:
         max_length=args.max_seq_length,  # trl renamed SFTConfig's max_seq_length -> max_length in newer releases; CLI flag name kept for stability
         eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
+        # Runs both teacher-forced loss and FunctionCallEvalCallback at step zero,
+        # after logger setup but before the first optimizer update.
+        eval_on_start=True,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
@@ -390,7 +483,7 @@ def main() -> None:
         metric_for_best_model="fc_call_correctness",
         greater_is_better=True,
         bf16=True,
-        dataset_text_field="text",
+        completion_only_loss=True,
         report_to=[],
         # Trades compute for activation memory: without this, training already sits
         # within ~3.6GiB of the 80GiB H100 ceiling at batch 16/seq 8192 (hit a real CUDA
@@ -406,6 +499,7 @@ def main() -> None:
         args.val_file,
         eval_samples=args.metrics_eval_samples,
         max_new_tokens=args.metrics_max_new_tokens,
+        log_artifacts=args.mlflow,
     )
 
     trainer = SFTTrainer(

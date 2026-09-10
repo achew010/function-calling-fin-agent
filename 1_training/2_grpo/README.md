@@ -1,5 +1,12 @@
 # 2. GRPO
 
+Generation-based checkpoint evaluation uses the full validation split by default
+(`--metrics-eval-samples 0`), including a step-zero measurement of the starting SFT
+policy. The shared SFT callback saves per-turn predictions and paired conversation
+bootstrap comparisons to this baseline; see `../1_sft/README.md` for report paths and
+comparison commands. Positive sample counts remain available for smoke tests.
+Reserve the test split for the final comparison after selecting a checkpoint.
+
 **Why this exists as a separate, later stage — not the initial training loop:** function
 calling has a rare property that makes RL genuinely attractive: the reward is trivially,
 deterministically computable (parse the output, check the function name and arguments
