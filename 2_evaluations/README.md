@@ -125,6 +125,27 @@ python run_latency_benchmark.py --endpoint http://localhost:8000/v1 --model Qwen
   --prompts-file ../0_data/data/test.jsonl --concurrency 1 8 16 24 32
 ```
 
+### `log_vllm_bench_to_mlflow.py`
+
+Runs `vllm`'s own built-in `vllm bench serve` (real tool-calling traffic via its
+`BFCLDataset` loader — see root README's step 5) as a subprocess and logs its
+mean/median/p99 TTFT, TPOT, inter-token latency, and request/output/total-token
+throughput to MLflow, under the `fin-agent-vllm-bench` experiment — one run per
+invocation, so a concurrency sweep shows up as directly comparable rows instead of only
+living in `vllm bench serve`'s own local `--save-result` JSON.
+
+```bash
+python log_vllm_bench_to_mlflow.py \
+  --mlflow-tracking-uri http://localhost:5000 \
+  --base-url http://localhost:8000 --model Qwen/Qwen3-8B \
+  --bfcl-categories simple,multiple,parallel,parallel_multiple --max-concurrency 32
+```
+
+Bare-host analogue: `tox -e vllm-bench -- <same flags>` (see `tox.ini`'s
+`[testenv:vllm-bench]`). Requires `kubectl -n fin-agent port-forward svc/mlflow
+5000:5000` running, same as this file's "Evaluating a specific MLflow run against BFCL"
+section below.
+
 ## Evaluating a specific MLflow run against BFCL
 
 Every checkpoint this project trains gets logged to MLflow as a `model` artifact

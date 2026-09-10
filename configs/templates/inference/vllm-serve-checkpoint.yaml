@@ -1,0 +1,124 @@
+# Template (NOT directly kubectl-apply-able — substitute __NAME__/__RUN_ID__ first, see
+# below): serves a specific MLflow-tracked run's model artifact via vLLM, nothing else —
+# no BFCL Job, no results PVC. Same Deployment+Service as
+# ./bfcl-eval-mlflow-checkpoint-job.yaml (same names too, so it's a drop-in substitute:
+# anything already pointed at fin-agent-vllm-__NAME__ works against either), pulled out
+# on its own for cases that just want an endpoint to hit — e.g. `vllm bench serve`
+# (see root README's step 5) — without also standing up that file's BFCL eval Job.
+#
+# Render + apply by hand:
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' \
+#       vllm-serve-checkpoint.yaml | kubectl apply -f -
+#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job pulls from)
+#   2. The MLflow run must have a "model" artifact (train_sft.py/train_grpo.py with
+#      --mlflow both log one, at mlflow.log_artifacts(..., artifact_path="model"))
+#
+# Clean up (a Deployment — it never exits on its own):
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' \
+#       vllm-serve-checkpoint.yaml | kubectl delete -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: fin-agent-vllm-__NAME__ }
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-__NAME__ }
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        - name: fetch-model
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /model/config.json ]; then
+                echo "model already staged in /model, skipping download"
+              else
+                pip install --no-cache-dir mlflow
+                python3 -c "
+              import pathlib, mlflow
+              # download_artifacts nests its output under a directory named after
+              # artifact_path -- verified against mlflow directly, not assumed: with
+              # dst_path=/model it returns /model/model, leaving config.json one level
+              # deeper than vLLM looks for it ('Invalid repository ID or local directory
+              # specified: /model'). Flatten it here so /model is the model directory.
+              # Staging *inside* /model keeps this on one filesystem, so the moves below
+              # are renames rather than a second full copy of ~16GB of weights.
+              src = pathlib.Path(mlflow.artifacts.download_artifacts(
+                  run_id='__RUN_ID__', artifact_path='model', dst_path='/model/.staging'))
+              dest = pathlib.Path('/model')
+              for item in src.iterdir():
+                  item.rename(dest / item.name)
+              "
+                rm -rf /model/.staging
+              fi
+              test -f /model/config.json || { echo "no config.json in /model after download"; ls -laR /model; exit 1; }
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.fin-agent.svc.cluster.local:5000
+          volumeMounts:
+            - { name: mlflow-artifacts, mountPath: /data/artifacts, readOnly: true }
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:cu130-nightly   # same image as ./vllm-qwen3-8b.yaml
+          imagePullPolicy: IfNotPresent
+          # --served-model-name Qwen/Qwen3-8B (not the local path) and --max-model-len
+          # 40960 (Qwen3-8B's real native context) -- same reasoning as
+          # ./bfcl-eval-mlflow-checkpoint-job.yaml and ./vllm-qwen3-8b.yaml's headers.
+          command:
+            - sh
+            - -c
+            - >-
+              exec vllm serve /model
+              --served-model-name Qwen/Qwen3-8B
+              --gpu-memory-utilization 0.5
+              --max-model-len 40960
+              --host 0.0.0.0 --port 8000
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80            # ~20 min budget -- includes the MLflow-artifact download, not just weight load
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
+        - name: model-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  selector: { app: fin-agent-vllm-__NAME__ }
+  ports:
+    - port: 8000
+      targetPort: 8000
