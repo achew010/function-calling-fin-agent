@@ -13,7 +13,8 @@
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
 #     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py \
-#     --from-file=patch_bfcl_qwen_handler.py=2_evaluations/patch_bfcl_qwen_handler.py
+#     --from-file=patch_bfcl_qwen_handler.py=2_evaluations/patch_bfcl_qwen_handler.py \
+#     --from-file=summarize_bfcl_errors.py=2_evaluations/summarize_bfcl_errors.py
 #
 # Run — prefer ./run-bfcl-eval.sh, which applies the vLLM server this Job depends on,
 # waits for it to be Ready, and only then applies this Job (applying this file alone
@@ -119,6 +120,17 @@ spec:
                 --run-id-file /data/bfcl/mlflow_run_id.txt
           volumeMounts:
             - { name: src, mountPath: /src }
+            # mlflow.log_artifacts()/log_text() in log_bfcl_to_mlflow.py write
+            # STRAIGHT TO THE FILESYSTEM at the run's artifact_uri, because this
+            # project's MLflow server runs with a bare local --default-artifact-root
+            # (/data/artifacts -- see setup/mlflow.yaml's header). Metrics travel
+            # over HTTP and so land fine without this mount; artifacts do not. Without
+            # the same PVC mounted at the same path the server uses, those writes
+            # succeed into some other filesystem and are simply never visible in
+            # MLflow -- no error, no artifacts, exactly what setup/mlflow.yaml's own
+            # header warns about. Same mount ../training/sft-job.yaml already carries
+            # for the same reason.
+            - { name: mlflow-artifacts, mountPath: /data/artifacts }
             - { name: bfcl-data, mountPath: /data/bfcl }
           resources:
             # ephemeral-storage bumped from an initial 4Gi limit, which got the pod
@@ -130,5 +142,7 @@ spec:
       volumes:
         - name: src
           configMap: { name: fin-agent-bfcl-src }
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
         - name: bfcl-data
           persistentVolumeClaim: { claimName: fin-agent-bfcl-results }
