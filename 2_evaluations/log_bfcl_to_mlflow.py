@@ -25,12 +25,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import mlflow
 
 from run_bfcl_eval import BFCLEvaluator
+from summarize_bfcl_errors import collect, error_type_counts, render_report
 
 # The public leaderboard's own headline "Overall Acc" is a composite across five domains
 # (Agentic, Multi-Turn, Single-Turn/AST, Hallucination, Format Sensitivity), with Agentic
@@ -70,6 +72,43 @@ LEADERBOARD_QWEN3_8B_REFERENCE = {
     "Prompt": {"non_live_ast": 0.8856, "live_ast": 0.8009},
     "FC": {"non_live_ast": 0.8758, "live_ast": 0.8053},
 }
+
+
+def log_failure_detail(bfcl_project_root: Path, model: str, samples: int = 3) -> None:
+    """Log everything the run produced beyond the headline accuracy: per-error-type
+    failure counts as metrics, the rendered error report, and the raw generation/score
+    files themselves as artifacts.
+
+    Without this, a run's generations and per-failure detail (what the model actually
+    emitted, what was expected, which checker rejected it) only ever existed on the
+    results PVC -- unreachable once the pod was gone, and never tied to the MLflow run
+    whose accuracy number they explain.
+
+    Safe to call once per category when several share a run (see the Job manifests'
+    category loop): collect() re-globs every score file under the root each time, so the
+    last call logs the cumulative picture, and re-logging an artifact path just
+    overwrites it.
+    """
+    score_dir = bfcl_project_root / "score"
+    result_dir = bfcl_project_root / "result"
+
+    by_group = collect(score_dir, model)
+    for group, counter in error_type_counts(by_group).items():
+        group_slug = "live" if group == "Live" else "non_live"
+        for error_type, count in counter.items():
+            # MLflow restricts metric names; error_type carries colons
+            # ("value_error:string"), so flatten anything outside its safe set.
+            error_slug = re.sub(r"[^A-Za-z0-9_.\-]", "_", error_type)
+            mlflow.log_metric(f"bfcl_error_{group_slug}_{error_slug}", count)
+        mlflow.log_metric(f"bfcl_failures_{group_slug}", sum(counter.values()))
+
+    mlflow.log_text(render_report(by_group, samples=samples), "bfcl_error_summary.txt")
+    # The raw material behind the numbers: result/ is every generation the model
+    # produced, score/ is every failed case with its expected answer and checker error.
+    if result_dir.is_dir():
+        mlflow.log_artifacts(str(result_dir), artifact_path="bfcl_generations")
+    if score_dir.is_dir():
+        mlflow.log_artifacts(str(score_dir), artifact_path="bfcl_scores")
 
 
 def read_category_summaries(score_dir: Path, model: str) -> dict[str, dict]:
@@ -148,6 +187,22 @@ def main() -> None:
         "evaluate run), so a concurrently-started poll_bfcl_progress.py process can "
         "attach to the same run via --mlflow-run-id.",
     )
+    parser.add_argument(
+        "--model-source-run-id",
+        default=None,
+        help="The MLflow run id whose 'model' artifact this evaluation is serving (i.e. "
+        "the SFT/GRPO training run that produced the checkpoint). Logged as a param so "
+        "a score is traceable back to the exact training run it came from -- without it, "
+        "an eval run records only 'Qwen/Qwen3-8B' and nothing distinguishes one "
+        "checkpoint's numbers from another's. Omit for the untuned baseline, which has "
+        "no source run.",
+    )
+    parser.add_argument(
+        "--failure-samples",
+        type=int,
+        default=3,
+        help="Sample failures per dominant error type in the logged bfcl_error_summary.txt artifact.",
+    )
     args = parser.parse_args()
 
     os.environ["BFCL_PROJECT_ROOT"] = args.bfcl_project_root
@@ -202,6 +257,12 @@ def main() -> None:
             mlflow.log_param("test_category", args.test_category)
             mlflow.log_param("backend", args.backend)
             mlflow.log_param("num_threads", args.num_threads)
+            # Which training run's checkpoint these numbers actually describe. Also a
+            # tag, so it's filterable in MLflow's run list ("show me every eval of run
+            # X") rather than only visible once a run is opened.
+            if args.model_source_run_id:
+                mlflow.log_param("model_source_run_id", args.model_source_run_id)
+                mlflow.set_tag("model_source_run_id", args.model_source_run_id)
             # Which leaderboard row this run is actually the analogue of (FC and Prompt
             # are tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
             # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both
@@ -269,6 +330,15 @@ def main() -> None:
         if total_count:
             mlflow.log_metric("bfcl_overall_accuracy", total_correct / total_count)
         mlflow.log_metric("bfcl_categories_evaluated", len(summaries))
+
+        # Everything behind those numbers: per-error-type counts, the rendered error
+        # report, and the raw generation/score files. Best-effort -- a scored run whose
+        # accuracy metrics already logged shouldn't be thrown away because the extra
+        # detail failed to upload.
+        try:
+            log_failure_detail(Path(args.bfcl_project_root), args.model, samples=args.failure_samples)
+        except Exception as e:
+            print(f"WARNING: failed to log BFCL failure detail/artifacts: {e}")
 
 
 if __name__ == "__main__":
