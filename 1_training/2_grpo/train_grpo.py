@@ -55,8 +55,12 @@ from run_internal_eval import build_eval_instances, load_examples, normalize_cal
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "1_sft"))
 from train_sft import FunctionCallEvalCallback  # noqa: E402
 
+import statistics
+
+import torch
 from datasets import Dataset
 from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from scipy.optimize import linear_sum_assignment
 
@@ -196,6 +200,183 @@ def build_pilot_dataset(train_file: Path, val_file: Path, size: int = 256, seed:
     return Dataset.from_list([{key: row[key] for key in columns} for row in selected]), manifest
 
 
+class StallStopCallback(TrainerCallback):
+    """Abort a run that hasn't moved at all by `check_step`.
+
+    Deliberately NOT transformers' EarlyStoppingCallback, which stops once a metric
+    stops IMPROVING after some patience. This answers a different question: by step N,
+    has the run moved *at all*? A GRPO run whose prompt groups are mostly reward-tied
+    produces near-zero advantage and therefore near-zero gradient, and its greedy
+    validation metrics then sit exactly where they started -- measured at 50-85% of
+    groups tied. That run is worth killing at step 25 rather than letting it spend its
+    full budget proving the same point.
+
+    Reads the metrics dict rather than the logs because FunctionCallEvalCallback mutates
+    that dict in place (train_sft.py's `metrics.update(...)` / `metrics[...] = ...`), so
+    the generation-based numbers are visible here -- but ONLY if this callback is
+    ordered after it in GRPOTrainer(callbacks=[...]).
+
+    Baseline comes from the step-0 evaluation, which exists because GRPOConfig sets
+    eval_on_start=True.
+    """
+
+    def __init__(self, metric_names: list[str], check_step: int, min_delta: float) -> None:
+        self.metric_names = list(metric_names)
+        self.check_step = check_step
+        self.min_delta = min_delta
+        self.baseline: dict[str, float] = {}
+        self.warned_missing = False
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        observed = {name: metrics[name] for name in self.metric_names if name in metrics}
+        missing = [name for name in self.metric_names if name not in metrics]
+        if missing and not self.warned_missing:
+            self.warned_missing = True
+            # Loud once: a typo'd metric name would otherwise mean this callback
+            # silently never fires, which looks identical to "the run is progressing".
+            print(f"WARNING: StallStopCallback cannot see {missing}; watching {sorted(observed)} only. "
+                  f"Available: {sorted(k for k in metrics if k.startswith('eval_'))}", flush=True)
+        if not observed:
+            return
+        if not self.baseline:
+            self.baseline = observed
+            print(f"[stall-check] baseline at step {state.global_step}: "
+                  f"{ {k: round(v, 4) for k, v in observed.items()} }", flush=True)
+            return
+        if state.global_step < self.check_step:
+            return
+        deltas = {name: abs(value - self.baseline[name])
+                  for name, value in observed.items() if name in self.baseline}
+        if deltas and max(deltas.values()) < self.min_delta:
+            print(f"[stall-check] STOPPING at step {state.global_step}: no watched metric moved by "
+                  f"{self.min_delta} since baseline ({ {k: round(v, 6) for k, v in deltas.items()} }). "
+                  f"The run is not learning -- check the tied-group fraction in pilot_selection.json "
+                  f"and the effective learning rate before spending more budget.", flush=True)
+            control.should_training_stop = True
+
+
+@torch.no_grad()
+def rollout_reward_groups(
+    rows: list[dict[str, Any]], base_model: str, num_generations: int, temperature: float,
+    max_new_tokens: int, batch_size: int, reward_mode: str,
+) -> list[list[float]]:
+    """Sample `num_generations` completions per row from the CURRENT policy and score
+    each with compute_reward -- i.e. the exact group of rewards GRPO would compute for
+    that prompt on step 1.
+
+    Loads and frees its own copy of the model: GRPOTrainer takes a model *path* and
+    loads internally, so there is nothing to borrow at selection time. The two loads are
+    sequential, not concurrent, so peak memory is unchanged.
+
+    Sampling deliberately mirrors the training rollouts (same temperature, same
+    enable_thinking=False chat template as grpo_config.chat_template_kwargs) -- a group
+    scored under different sampling than training sees would be measuring the wrong
+    distribution.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    padding_side = tokenizer.padding_side
+    # torch_dtype/device_map spelled exactly as train_sft.py loads the same checkpoint --
+    # the kwarg name changed across transformers releases, so match the call this repo
+    # already runs against its pinned version rather than the newer spelling.
+    model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto", torch_dtype="bfloat16")
+    eos_ids = model.generation_config.eos_token_id or tokenizer.eos_token_id
+    eos_ids = [eos_ids] if isinstance(eos_ids, int) else list(eos_ids or [])
+    groups: list[list[float]] = []
+    try:
+        model.eval()
+        tokenizer.padding_side = "left"  # decoder-only batched generation
+        for offset in range(0, len(rows), batch_size):
+            batch = rows[offset: offset + batch_size]
+            print(f"[select] rollouts {offset + 1}-{offset + len(batch)}/{len(rows)}", flush=True)
+            prompts = [
+                tokenizer.apply_chat_template(
+                    row["prompt"], tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
+                for row in batch
+            ]
+            inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
+            outputs = model.generate(
+                **inputs,
+                do_sample=True,
+                temperature=temperature,
+                num_return_sequences=num_generations,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids or None,
+            )
+            # generate() returns rows grouped per input: [row0 x G, row1 x G, ...].
+            prompt_length = inputs["input_ids"].shape[1]
+            for index, row in enumerate(batch):
+                expected_calls = json.loads(row["expected_calls"])
+                rewards = []
+                for sequence in outputs[index * num_generations: (index + 1) * num_generations]:
+                    completion_ids = sequence[prompt_length:].tolist()
+                    # Batched completions are padded out to the longest in the batch;
+                    # count only through the first stopping token.
+                    stop = next((i for i, token in enumerate(completion_ids) if token in eos_ids), None)
+                    if stop is not None:
+                        completion_ids = completion_ids[: stop + 1]
+                    text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+                    rewards.append(compute_reward(
+                        text, row["tool_names"], row["is_call_case"], expected_calls, reward_mode))
+                groups.append(rewards)
+    finally:
+        tokenizer.padding_side = padding_side
+        del model
+        torch.cuda.empty_cache()
+    return groups
+
+
+def select_informative_rows(
+    rows: list[dict[str, Any]], groups: list[list[float]], target_size: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep only prompts whose rollouts DISAGREE, highest-spread first, bucket-balanced.
+
+    This is the whole point of rollout-based selection. GRPO's advantage is
+    (reward - group_mean) / group_std, so a group where every rollout earns the same
+    reward contributes exactly zero advantage to every one of its members and therefore
+    zero gradient -- whether the model got it always right or always wrong. Selecting by
+    heuristic category (build_pilot_dataset's buckets) says nothing about whether the
+    CURRENT policy is uncertain there, which is why most groups came back tied.
+
+    Bucket balance is preserved by round-robin across buckets rather than taking a flat
+    top-N: spread alone would happily return an all-abstention set and quietly drop the
+    call-side guard examples build_pilot_dataset deliberately reserves.
+    """
+    scored: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    zero_variance = 0
+    for row, rewards in zip(rows, groups):
+        spread = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
+        if spread == 0.0:  # always-correct or always-wrong: no learning signal
+            zero_variance += 1
+            continue
+        scored.setdefault(row.get("pilot_bucket", "unbucketed"), []).append((spread, row))
+
+    for candidates in scored.values():
+        candidates.sort(key=lambda item: item[0], reverse=True)
+    selected: list[dict[str, Any]] = []
+    while len(selected) < target_size and any(scored.values()):
+        for candidates in scored.values():
+            if candidates and len(selected) < target_size:
+                spread, row = candidates.pop(0)
+                selected.append({**row, "rollout_reward_spread": spread})
+
+    informative = sum(len(v) for v in scored.values()) + len(selected)
+    stats = {
+        "candidates": len(rows),
+        "zero_variance_dropped": zero_variance,
+        "informative": informative,
+        "informative_fraction": round(informative / len(rows), 4) if rows else 0.0,
+        "selected": len(selected),
+        "selected_counts": dict(Counter(row.get("pilot_bucket", "unbucketed") for row in selected)),
+        "mean_selected_spread": round(
+            statistics.fmean(row["rollout_reward_spread"] for row in selected), 4) if selected else 0.0,
+    }
+    return selected, stats
+
+
 def select_probe_ids(val_file: Path, size: int = 128, seed: int = 42) -> list[int]:
     """Round-robin stratification by conversation call_type; never by model errors."""
     if size < 1:
@@ -332,6 +513,54 @@ def main() -> None:
     parser.add_argument("--pilot-train-samples", type=int, default=256)
     parser.add_argument("--pilot-eval-samples", type=int, default=128)
     parser.add_argument("--pilot-seed", type=int, default=42)
+    parser.add_argument(
+        "--select-by-rollout",
+        action="store_true",
+        help="Select training prompts by actual post-SFT rollout DISAGREEMENT instead of "
+        "by heuristic bucket alone. Rolls out --select-rollouts completions per pilot "
+        "candidate with the base checkpoint, scores each with the training reward, and "
+        "keeps only prompts whose rewards differ within the group. Groups whose rollouts "
+        "all score the same produce zero GRPO advantage and therefore zero gradient, so "
+        "spending updates on them is the dominant waste in a short run -- measured at "
+        "50-85% of groups tied (~70% average), i.e. roughly one informative prompt per "
+        "update at 4 unique prompts per update.",
+    )
+    parser.add_argument("--select-rollouts", type=int, default=8, help="Completions sampled per candidate during selection.")
+    parser.add_argument("--select-target-size", type=int, default=96, help="How many informative prompts to keep for training.")
+    parser.add_argument(
+        "--select-max-new-tokens",
+        type=int,
+        default=256,
+        help="Generation cap during selection only. Real call outputs run tens of tokens, "
+        "so the training-time 512 mostly buys worst-case headroom the selection pass "
+        "doesn't need -- and selection cost is linear in this.",
+    )
+    parser.add_argument("--select-batch-size", type=int, default=8, help="Candidates per generation batch (each expands by --select-rollouts).")
+    parser.add_argument(
+        "--stall-check-step",
+        type=int,
+        default=0,
+        help="Stop the run at this step if NO watched metric has moved since the step-0 "
+        "baseline (0 disables). Not 'stopped improving' -- 'never moved', the signature "
+        "of a run whose reward groups are tied and whose gradient is therefore ~0. "
+        "Pairs with --eval-steps: the check can only fire on an evaluation step.",
+    )
+    parser.add_argument(
+        "--stall-metrics",
+        nargs="+",
+        default=["eval_fc_call_correctness", "eval_refusal_accuracy"],
+        help="Metrics --stall-check-step watches. Must be names FunctionCallEvalCallback "
+        "puts in the metrics dict (eval_-prefixed); a name it can't see is warned about "
+        "once rather than silently ignored.",
+    )
+    parser.add_argument(
+        "--stall-min-delta",
+        type=float,
+        default=1e-4,
+        help="Movement below this counts as no movement. Small but nonzero: a stalled "
+        "GRPO run's greedy predictions are usually bit-identical, so the real deltas are "
+        "exactly 0.0 and this only has to clear float noise.",
+    )
     parser.add_argument("--num-generations", type=int, default=8, help="Group size G — completions sampled per prompt.")
     parser.add_argument(
         "--num-generations-eval",
@@ -359,6 +588,15 @@ def main() -> None:
         "if the policy drifts too far from the SFT checkpoint.",
     )
     parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--lr-scheduler-type",
+        default="linear",
+        help="transformers' scheduler name. The default 'linear' decays --lr to zero over "
+        "the run, so a 50-100 update run spends most of its updates at well under half the "
+        "nominal rate (1e-6 nominal -> ~5e-7 average). Use 'constant_with_warmup' with "
+        "--warmup-steps for a short run where the decay tail buys nothing.",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Linear warmup updates before the scheduler above takes over.")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument(
         "--max-steps",
@@ -438,6 +676,40 @@ def main() -> None:
     if args.pilot:
         train_dataset, selection = build_pilot_dataset(
             args.train_file, args.val_file, size=args.pilot_train_samples, seed=args.pilot_seed)
+        if args.select_by_rollout:
+            # build_pilot_dataset's output is now the CANDIDATE pool, not the training
+            # set: it selects by heuristic bucket, which says nothing about whether this
+            # checkpoint is actually uncertain on a prompt. Narrow it to the prompts
+            # whose rollouts disagree -- see select_informative_rows' docstring.
+            candidates = selection["examples"]
+            print(f"GRPO selection: rolling out {args.select_rollouts} completions for "
+                  f"{len(candidates)} candidates ...", flush=True)
+            groups = rollout_reward_groups(
+                candidates, args.base_model, num_generations=args.select_rollouts,
+                temperature=args.temperature, max_new_tokens=args.select_max_new_tokens,
+                batch_size=args.select_batch_size, reward_mode=args.reward_mode)
+            chosen, stats = select_informative_rows(candidates, groups, args.select_target_size)
+            if not chosen:
+                raise ValueError(
+                    "Rollout selection kept no prompts: every candidate group scored "
+                    "identically across rollouts. Raise --select-rollouts or --temperature, "
+                    "or widen --pilot-train-samples.")
+            selection["examples"] = chosen
+            selection["rollout_selection"] = {
+                "rollouts_per_candidate": args.select_rollouts,
+                "temperature": args.temperature,
+                "max_new_tokens": args.select_max_new_tokens,
+                "reward_mode": args.reward_mode,
+                "base_model": str(args.base_model),
+                **stats,
+            }
+            selection["selected_counts"] = stats["selected_counts"]
+            selection["n_targets"] = len(chosen)
+            columns = ("prompt", "tool_names", "is_call_case", "expected_calls")
+            train_dataset = Dataset.from_list([{key: row[key] for key in columns} for row in chosen])
+            print(f"GRPO selection: {stats['informative']}/{stats['candidates']} candidates informative "
+                  f"({stats['informative_fraction']:.0%}); {stats['zero_variance_dropped']} tied groups dropped; "
+                  f"training on {stats['selected']} ({stats['selected_counts']})", flush=True)
         probe_ids = select_probe_ids(args.val_file, args.pilot_eval_samples, args.pilot_seed)
         selection["validation_conversation_ids"] = probe_ids
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -471,6 +743,8 @@ def main() -> None:
         # match the behavior the model is actually served with.
         chat_template_kwargs={"enable_thinking": False},
         learning_rate=args.lr,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
@@ -516,7 +790,12 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=lora_config,
-        callbacks=[fc_callback],
+        # StallStopCallback must come AFTER fc_callback: it reads the generation-based
+        # metrics fc_callback adds to the metrics dict in place, and callbacks run in
+        # list order.
+        callbacks=[fc_callback] + ([StallStopCallback(
+            args.stall_metrics, args.stall_check_step, args.stall_min_delta,
+        )] if args.stall_check_step > 0 else []),
     )
     fc_callback.trainer = trainer  # see FunctionCallEvalCallback's docstring (train_sft.py) for why
 

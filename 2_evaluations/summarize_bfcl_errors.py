@@ -172,11 +172,14 @@ REMEDIES: dict[str, tuple[str, str]] = {
         "are larger/messier than training saw.",
     ),
     "simple_function_checker:wrong_count": (
-        "Wrong NUMBER of calls emitted.",
-        "In this repo the recurring shape is collapsing N parallel calls into ONE call with "
-        "list-valued arguments (e.g. `f(movie=['A','B'])` where two `f(...)` calls were "
-        "expected). Check how parallel calls are represented in the prepared training data "
-        "before touching hyperparameters -- this is a data-shape problem, not an LR problem.",
+        "Wrong NUMBER of calls emitted -- in practice always too FEW, in two shapes.",
+        "Observed at full scale: (a) in `parallel` (same function repeated) the model "
+        "collapses N calls into ONE with list-valued arguments, e.g. `f(movie=['A','B'])` "
+        "where two `f(...)` were expected; (b) in `parallel_multiple` (different functions) "
+        "it answers the first/most obvious function and omits the follow-ups entirely -- "
+        "2 of 4 expected calls, 1 of 2. Both are under-production of calls. Check how "
+        "multi-call turns are represented in the prepared training data before touching "
+        "hyperparameters -- this is a data-shape problem, not an LR problem.",
     ),
     "multiple_function_checker:wrong_count": (
         "Wrong NUMBER of calls emitted (multiple-function category).",
@@ -223,16 +226,24 @@ REMEDIES: dict[str, tuple[str, str]] = {
         "Same as type_error:simple, but inside a list/dict argument.",
     ),
     "value_error:string": (
-        "Right parameter, wrong string value.",
-        "Frequently canonicalisation rather than comprehension: 'San Francisco' where "
-        "'San Francisco, CA' was expected, or answering in the query's own language. Check "
-        "the samples before concluding the model misunderstood the request.",
+        "Right parameter, wrong string value -- frequently NOT a capability failure.",
+        "A large share is answer-key strictness, not comprehension: 'Santa Cruz, United "
+        "States' rejected for 'Santa Cruz, USA', '123 Hanoi Street, Ha Noi, Vietnam' rejected "
+        "for '123 Hanoi Street', or a user's own typo copied faithfully where the key wanted "
+        "it corrected. Read a sample of these in bfcl_failures.csv and estimate the genuinely-"
+        "wrong fraction BEFORE acting -- training the model to rewrite user-supplied values is "
+        "a real regression risk, and this bucket is big enough to mislead a headline number.",
     ),
     "value_error:dict_value": ("Wrong value inside a dict argument.", "Inspect the sample's expected vs got dicts."),
     "value_error:dict_key": ("Wrong/missing key in a dict argument.", "Inspect the sample's expected vs got dicts."),
     "value_error:list/tuple": ("Wrong list/tuple contents.", "Check element order and count against the sample."),
     "value_error:list_dict_count": ("Wrong number of dicts in a list argument.", "Check the sample's expected list length."),
-    "value_error:others": ("Value mismatch not covered by a more specific checker.", "Inspect the sample directly."),
+    "value_error:others": (
+        "Value mismatch not covered by a more specific checker -- often a UNIT convention.",
+        "Observed at full scale: percentages passed as whole numbers where the schema wants "
+        "a fraction (`annual_rate=4.0` vs expected `0.04`, `depreciation_rate=2.0` vs `0.02`). "
+        "Systematic and learnable. Inspect the samples before assuming a reasoning error.",
+    ),
 }
 
 # Below this many scored cases a group's accuracy cannot be meaningfully compared against
