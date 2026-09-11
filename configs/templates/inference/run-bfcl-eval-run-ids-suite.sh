@@ -22,6 +22,15 @@
 #   ./run-bfcl-eval-run-ids-suite.sh              # smoke scale (default)
 #   FULL_SCALE=1 ./run-bfcl-eval-run-ids-suite.sh # full python category for every model
 #   SFT_RUN_ID=<id> GRPO_RUN_ID=<id> ./run-bfcl-eval-run-ids-suite.sh   # override the run_ids below
+#   QUANTIZATION=fp8_per_tensor FULL_SCALE=1 MODELS="baseline sft" \
+#     SFT_RUN_ID=<id> ./run-bfcl-eval-run-ids-suite.sh   # same eval, weights quantized on load
+#
+# QUANTIZATION serves the SAME artifacts through vLLM's online (load-time) quantization,
+# so an FP8 parity check needs no separate checkpoint. Results land under suffixed names
+# (e.g. experiment fin-agent-bfcl-eval-sft-fp8-per-tensor, results /data/bfcl-sft-fp8-per-tensor)
+# so they sit beside the bf16 numbers rather than overwriting the very thing they're being
+# compared against. Run the bf16 pass first, then the quantized one, then compare
+# bfcl_non_live_ast_accuracy/bfcl_live_ast_accuracy across the two experiments.
 #
 # Each stage's Job/Deployment is deleted and reapplied if a prior one exists -- same
 # reasoning as run-bfcl-eval-suite.sh (Job pod templates are immutable, a bare
@@ -65,24 +74,68 @@ if [ "${FULL_SCALE:-0}" = "1" ]; then
   echo ">> FULL_SCALE=1: evaluating every model on the full 'python' category (hours per model, not minutes)"
 fi
 
+# QUANTIZATION runs the same evaluation against a vLLM server that quantizes the weights
+# on load, e.g. QUANTIZATION=fp8_per_tensor (a real vLLM online-quantization shorthand --
+# verified against vllm's own QuantizationMethods registry, which registers
+# fp8_per_tensor/fp8_per_block/fp8_per_channel as online shorthands). No pre-quantized
+# checkpoint is needed: the same bf16 artifact is quantized at load time.
+#
+# Every name a run touches gets VARIANT appended -- Deployment/Service, Job, the BFCL
+# results directory and the MLflow experiment -- so a quantized run is a SEPARATE,
+# side-by-side result rather than something that overwrites the bf16 numbers it exists to
+# be compared against. Underscores are not legal in Kubernetes object names, hence the tr.
+QUANTIZATION="${QUANTIZATION:-}"
+VLLM_EXTRA_ARGS=""
+VARIANT=""
+if [ -n "${QUANTIZATION}" ]; then
+  VLLM_EXTRA_ARGS="--quantization ${QUANTIZATION}"
+  VARIANT="-$(printf '%s' "${QUANTIZATION}" | tr '_' '-')"
+  echo ">> QUANTIZATION=${QUANTIZATION}: serving quantized, results suffixed '${VARIANT}'"
+fi
+
 run_baseline() {
-  echo ">> [baseline] Qwen/Qwen3-8B (no fine-tuning)"
-  kubectl -n "${NAMESPACE}" delete job fin-agent-bfcl-eval-qwen3-8b --ignore-not-found --wait=true
-  kubectl -n "${NAMESPACE}" delete deployment fin-agent-vllm-qwen3-8b --ignore-not-found --wait=true
-  kubectl apply -f "${SCRIPT_DIR}/vllm-qwen3-8b.yaml"
-  kubectl -n "${NAMESPACE}" rollout status deploy/fin-agent-vllm-qwen3-8b --timeout=900s
-  sed "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" "${SCRIPT_DIR}/bfcl-eval-baseline-categories-job.yaml" \
-    | kubectl apply -f -
-  kubectl -n "${NAMESPACE}" wait --for=condition=complete job/fin-agent-bfcl-eval-qwen3-8b --timeout="${WAIT_TIMEOUT}"
-  kubectl -n "${NAMESPACE}" logs -l app=fin-agent-bfcl-eval-qwen3-8b --tail=20
-  kubectl -n "${NAMESPACE}" delete -f "${SCRIPT_DIR}/vllm-qwen3-8b.yaml" --ignore-not-found
+  local name="qwen3-8b${VARIANT}"
+  echo ">> [baseline] Qwen/Qwen3-8B (no fine-tuning)${VARIANT:+ [${QUANTIZATION}]}"
+  kubectl -n "${NAMESPACE}" delete job "fin-agent-bfcl-eval-${name}" --ignore-not-found --wait=true
+  kubectl -n "${NAMESPACE}" delete deployment "fin-agent-vllm-${name}" --ignore-not-found --wait=true
+  # vllm-qwen3-8b.yaml is deliberately NOT a template -- it stays directly
+  # kubectl-apply-able, as its own header documents and other manifests reference. So the
+  # unquantized path applies it untouched (byte-identical to before), and only the
+  # quantized path renders a copy. That render is verified rather than trusted: a sed
+  # that silently matched nothing would serve bf16 while every name claimed FP8, which is
+  # exactly the kind of silently-wrong result this suite has been bitten by before.
+  if [ -z "${QUANTIZATION}" ]; then
+    kubectl apply -f "${SCRIPT_DIR}/vllm-qwen3-8b.yaml"
+  else
+    local server
+    server="$(sed -e "s/fin-agent-vllm-qwen3-8b/fin-agent-vllm-${name}/g" \
+      -e "s|--max-model-len 40960|--max-model-len 40960 ${VLLM_EXTRA_ARGS}|" \
+      "${SCRIPT_DIR}/vllm-qwen3-8b.yaml")"
+    case "${server}" in
+      *"--quantization ${QUANTIZATION}"*) ;;
+      *) echo "ERROR: failed to inject '${VLLM_EXTRA_ARGS}' into vllm-qwen3-8b.yaml -- its --max-model-len line must have changed" >&2; exit 1 ;;
+    esac
+    echo "${server}" | kubectl apply -f -
+  fi
+  kubectl -n "${NAMESPACE}" rollout status "deploy/fin-agent-vllm-${name}" --timeout=900s
+  sed -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" -e "s/__VARIANT__/${VARIANT}/g" \
+    "${SCRIPT_DIR}/bfcl-eval-baseline-categories-job.yaml" | kubectl apply -f -
+  kubectl -n "${NAMESPACE}" wait --for=condition=complete "job/fin-agent-bfcl-eval-${name}" --timeout="${WAIT_TIMEOUT}"
+  kubectl -n "${NAMESPACE}" logs -l "app=fin-agent-bfcl-eval-${name}" --tail=20
+  kubectl -n "${NAMESPACE}" delete deployment "fin-agent-vllm-${name}" --ignore-not-found
+  kubectl -n "${NAMESPACE}" delete service "fin-agent-vllm-${name}" --ignore-not-found
 }
 
 run_mlflow_checkpoint() {
-  local name="$1" run_id="$2"
+  # VARIANT rides on __NAME__, which already drives every identifier in this manifest
+  # (Deployment, Service, Job, --bfcl-project-root, --mlflow-experiment-name), so a
+  # quantized run isolates itself everywhere for free.
+  local name="$1${VARIANT}" run_id="$2"
   echo ">> [${name}] MLflow run_id=${run_id}"
   local rendered
-  rendered="$(sed -e "s/__NAME__/${name}/g" -e "s/__RUN_ID__/${run_id}/g" -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" \
+  rendered="$(sed -e "s/__NAME__/${name}/g" -e "s/__RUN_ID__/${run_id}/g" \
+    -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" \
+    -e "s|__VLLM_EXTRA_ARGS__|${VLLM_EXTRA_ARGS}|g" \
     "${SCRIPT_DIR}/bfcl-eval-mlflow-checkpoint-job.yaml")"
   kubectl -n "${NAMESPACE}" delete job "fin-agent-bfcl-eval-${name}" --ignore-not-found --wait=true
   kubectl -n "${NAMESPACE}" delete deployment "fin-agent-vllm-${name}" --ignore-not-found --wait=true

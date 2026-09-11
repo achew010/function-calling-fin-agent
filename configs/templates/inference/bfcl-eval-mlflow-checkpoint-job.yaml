@@ -123,6 +123,14 @@ spec:
           # BFCL's own error handling swallows and writes into results as literal
           # "Error during inference: ..." text -- a run that "completes" abnormally
           # fast with near-zero scores and no visible error unless you grep for it.
+          # __VLLM_EXTRA_ARGS__ is appended to the --max-model-len line rather than given
+          # a line of its own, and that placement is load-bearing: this is a YAML FOLDED
+          # scalar (>-), where a line that becomes empty after substitution folds to a
+          # NEWLINE instead of a space -- which would split `exec vllm serve ...` from
+          # `--host 0.0.0.0` and leave the shell trying to run `--host` as a command.
+          # Riding on an existing line means the bf16 case degrades to a harmless
+          # trailing space. Substituted by run-bfcl-eval-run-ids-suite.sh (empty for
+          # bf16, `--quantization <method>` for a quantized run).
           command:
             - sh
             - -c
@@ -130,7 +138,7 @@ spec:
               exec vllm serve /model
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
-              --max-model-len 40960
+              --max-model-len 40960 __VLLM_EXTRA_ARGS__
               --host 0.0.0.0 --port 8000
           env:
             - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN

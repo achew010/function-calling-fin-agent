@@ -40,7 +40,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fin-agent-bfcl-eval-qwen3-8b
+  name: fin-agent-bfcl-eval-qwen3-8b__VARIANT__
   namespace: fin-agent
 spec:
   # backoffLimit 0 + restartPolicy Never, NOT bfcl-eval-job.yaml's retry-and-resume
@@ -53,7 +53,7 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      labels: { app: fin-agent-bfcl-eval-qwen3-8b }
+      labels: { app: fin-agent-bfcl-eval-qwen3-8b__VARIANT__ }
     spec:
       restartPolicy: Never
       containers:
@@ -70,7 +70,7 @@ spec:
               python3 patch_bfcl_qwen_handler.py
               python3 -c "
               import time, urllib.request
-              url = 'http://fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local:8000/health'
+              url = 'http://fin-agent-vllm-qwen3-8b__VARIANT__.fin-agent.svc.cluster.local:8000/health'
               for i in range(80):
                   try:
                       urllib.request.urlopen(url, timeout=5)
@@ -80,17 +80,17 @@ spec:
               else:
                   raise SystemExit('vLLM server did not become ready in time — apply ../inference/vllm-qwen3-8b.yaml first')
               "
-              rm -rf /data/bfcl-qwen3-8b && mkdir -p /data/bfcl-qwen3-8b
+              rm -rf /data/bfcl-qwen3-8b__VARIANT__ && mkdir -p /data/bfcl-qwen3-8b__VARIANT__
               for category in __TEST_CATEGORIES__; do
                 echo "--- category: ${category} ---"
                 python3 log_bfcl_to_mlflow.py \
                   --model Qwen/Qwen3-8B --test-category "${category}" \
                   --skip-server-setup --num-threads 8 \
-                  --vllm-endpoint fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local --vllm-port 8000 \
-                  --bfcl-project-root /data/bfcl-qwen3-8b \
+                  --vllm-endpoint fin-agent-vllm-qwen3-8b__VARIANT__.fin-agent.svc.cluster.local --vllm-port 8000 \
+                  --bfcl-project-root /data/bfcl-qwen3-8b__VARIANT__ \
                   --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
-                  --mlflow-experiment-name fin-agent-bfcl \
-                  --run-id-file /data/bfcl-qwen3-8b/mlflow_run_id.txt
+                  --mlflow-experiment-name fin-agent-bfcl__VARIANT__ \
+                  --run-id-file /data/bfcl-qwen3-8b__VARIANT__/mlflow_run_id.txt
               done
           volumeMounts:
             - { name: src, mountPath: /src }
