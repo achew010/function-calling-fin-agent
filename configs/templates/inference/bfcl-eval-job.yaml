@@ -12,7 +12,8 @@
 # Build the source ConfigMap before applying:
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
-#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py \
+#     --from-file=patch_bfcl_qwen_handler.py=2_evaluations/patch_bfcl_qwen_handler.py
 #
 # Run — prefer ./run-bfcl-eval.sh, which applies the vLLM server this Job depends on,
 # waits for it to be Ready, and only then applies this Job (applying this file alone
@@ -91,6 +92,7 @@ spec:
               # ModuleNotFoundError inside batch_inference() on the first --skip-server-setup run).
               pip install --no-cache-dir "bfcl-eval==2025.8.6.2" transformers soundfile jinja2 mlflow openai aiohttp
               cp /src/*.py /workspace/
+              python3 patch_bfcl_qwen_handler.py
               python3 -c "
               import time, urllib.request
               url = 'http://fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local:8000/health'

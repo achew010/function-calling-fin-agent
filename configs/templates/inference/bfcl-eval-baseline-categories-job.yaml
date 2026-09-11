@@ -24,7 +24,8 @@
 # Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses):
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
-#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py \
+#     --from-file=patch_bfcl_qwen_handler.py=2_evaluations/patch_bfcl_qwen_handler.py
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -65,6 +66,7 @@ spec:
               set -e
               pip install --no-cache-dir "bfcl-eval==2025.8.6.2" transformers soundfile jinja2 mlflow openai aiohttp
               cp /src/*.py /workspace/
+              python3 patch_bfcl_qwen_handler.py
               python3 -c "
               import time, urllib.request
               url = 'http://fin-agent-vllm-qwen3-8b.fin-agent.svc.cluster.local:8000/health'

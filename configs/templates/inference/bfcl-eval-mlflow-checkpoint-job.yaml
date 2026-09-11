@@ -35,7 +35,8 @@
 # Build the source ConfigMap before applying (same one bfcl-eval-job.yaml uses):
 #   kubectl create configmap fin-agent-bfcl-src -n fin-agent \
 #     --from-file=run_bfcl_eval.py=2_evaluations/run_bfcl_eval.py \
-#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py
+#     --from-file=log_bfcl_to_mlflow.py=2_evaluations/log_bfcl_to_mlflow.py \
+#     --from-file=patch_bfcl_qwen_handler.py=2_evaluations/patch_bfcl_qwen_handler.py
 #
 # Clean up (the vLLM server is a Deployment — it never exits on its own):
 #   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__TEST_CATEGORIES__/parallel live_parallel/g' \
@@ -195,6 +196,7 @@ spec:
               set -e
               pip install --no-cache-dir "bfcl-eval==2025.8.6.2" transformers soundfile jinja2 mlflow openai aiohttp
               cp /src/*.py /workspace/
+              python3 patch_bfcl_qwen_handler.py
               python3 -c "
               import time, urllib.request
               url = 'http://fin-agent-vllm-__NAME__.fin-agent.svc.cluster.local:8000/health'

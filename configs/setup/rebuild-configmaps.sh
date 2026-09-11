@@ -49,6 +49,7 @@ kubectl create configmap fin-agent-grpo-src -n "${NAMESPACE}" \
 kubectl create configmap fin-agent-bfcl-src -n "${NAMESPACE}" \
   --from-file=run_bfcl_eval.py="${PROJECT_ROOT}/2_evaluations/run_bfcl_eval.py" \
   --from-file=log_bfcl_to_mlflow.py="${PROJECT_ROOT}/2_evaluations/log_bfcl_to_mlflow.py" \
+  --from-file=patch_bfcl_qwen_handler.py="${PROJECT_ROOT}/2_evaluations/patch_bfcl_qwen_handler.py" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo ">> Done: fin-agent-data-prep-src, fin-agent-sft-src, fin-agent-grpo-src, fin-agent-bfcl-src"
