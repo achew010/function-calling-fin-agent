@@ -1,0 +1,200 @@
+# Template (NOT directly kubectl-apply-able — substitute __NAME__/__RUN_ID__/
+# __CONCURRENCY__ first, see below): serves a specific MLflow-tracked run's model
+# artifact via vLLM (same Deployment+Service as ./vllm-serve-checkpoint.yaml) AND runs
+# `vllm bench serve` against it, logging results to MLflow -- all in-cluster, so there's
+# no port-forwarding to babysit across three terminals (vLLM, MLflow, the benchmark
+# itself) the way the bare `vllm-serve-checkpoint.yaml` + `tox -e vllm-bench` combo
+# needs: the Job below reaches both the vLLM Deployment and MLflow over their normal
+# in-cluster Service DNS, same as every other Job in this directory.
+#
+# __CONCURRENCY__ is a single integer, not a sweep -- `vllm bench serve` (like this
+# whole Job) measures one concurrency level per run, logged as its own MLflow run (see
+# log_vllm_bench_to_mlflow.py's own docstring). Reapply with a different __CONCURRENCY__
+# for each point on the production comparison (1/8/16/24/32 -- see root README's
+# "Confirmed constraints"); the vLLM Deployment is left running between reapplies (the
+# Job is deleted/reapplied, the Deployment is not, mirroring
+# bfcl-eval-mlflow-checkpoint-job.yaml's own teardown discipline), so only the fast
+# benchmark step is repeated, not the multi-GB checkpoint download.
+#
+# Render + apply by hand for one concurrency level:
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
+#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
+#   kubectl -n fin-agent wait --for=condition=complete job/fin-agent-vllm-bench-sft --timeout=1800s
+#   kubectl -n fin-agent logs -l app=fin-agent-vllm-bench-sft --tail=40
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job pulls from and logs to)
+#   2. The MLflow run must have a "model" artifact (train_sft.py/train_grpo.py with
+#      --mlflow both log one, at mlflow.log_artifacts(..., artifact_path="model"))
+#
+# Build the source ConfigMap before applying (also built by setup/rebuild-configmaps.sh):
+#   kubectl create configmap fin-agent-vllm-bench-src -n fin-agent \
+#     --from-file=log_vllm_bench_to_mlflow.py=2_evaluations/log_vllm_bench_to_mlflow.py
+#
+# Clean up everything, including the vLLM Deployment (unlike a normal rerun at a new
+# __CONCURRENCY__, which leaves it running -- see above):
+#   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       vllm-bench-mlflow-checkpoint-job.yaml | kubectl delete -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: fin-agent-vllm-__NAME__ }
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-__NAME__ }
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        - name: fetch-model
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /model/config.json ]; then
+                echo "model already staged in /model, skipping download"
+              else
+                pip install --no-cache-dir mlflow
+                python3 -c "
+              import pathlib, mlflow
+              # download_artifacts nests its output under a directory named after
+              # artifact_path -- verified against mlflow directly, not assumed: with
+              # dst_path=/model it returns /model/model, leaving config.json one level
+              # deeper than vLLM looks for it ('Invalid repository ID or local directory
+              # specified: /model'). Flatten it here so /model is the model directory.
+              # Staging *inside* /model keeps this on one filesystem, so the moves below
+              # are renames rather than a second full copy of ~16GB of weights.
+              src = pathlib.Path(mlflow.artifacts.download_artifacts(
+                  run_id='__RUN_ID__', artifact_path='model', dst_path='/model/.staging'))
+              dest = pathlib.Path('/model')
+              for item in src.iterdir():
+                  item.rename(dest / item.name)
+              "
+                rm -rf /model/.staging
+              fi
+              test -f /model/config.json || { echo "no config.json in /model after download"; ls -laR /model; exit 1; }
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.fin-agent.svc.cluster.local:5000
+          volumeMounts:
+            - { name: mlflow-artifacts, mountPath: /data/artifacts, readOnly: true }
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:cu130-nightly   # same image as ./vllm-qwen3-8b.yaml
+          imagePullPolicy: IfNotPresent
+          # See ./vllm-serve-checkpoint.yaml's identical block for the full reasoning
+          # behind every flag here (max-model-len, tool-choice/tool-call-parser,
+          # default-chat-template-kwargs) -- kept in sync with that file by hand since
+          # this is a bundled copy, same convention as
+          # ./bfcl-eval-mlflow-checkpoint-job.yaml's own Deployment.
+          command:
+            - sh
+            - -c
+            - >-
+              exec vllm serve /model
+              --served-model-name Qwen/Qwen3-8B
+              --gpu-memory-utilization 0.5
+              --max-model-len 40960
+              --enable-auto-tool-choice
+              --tool-call-parser qwen3_xml
+              --default-chat-template-kwargs '{"enable_thinking": false}'
+              --host 0.0.0.0 --port 8000
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80            # ~20 min budget -- includes the MLflow-artifact download, not just weight load
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
+        - name: model-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  selector: { app: fin-agent-vllm-__NAME__ }
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fin-agent-vllm-bench-__NAME__
+  namespace: fin-agent
+spec:
+  backoffLimit: 0          # a broken benchmark run needs a human, not a silent retry
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-bench-__NAME__ }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: vllm-bench
+          image: python:3.12-slim   # no GPU needed -- this container only talks HTTP to the vLLM Service above
+          workingDir: /workspace
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir vllm mlflow
+              cp /src/*.py /workspace/
+              python3 -c "
+              import time, urllib.request
+              url = 'http://fin-agent-vllm-__NAME__.fin-agent.svc.cluster.local:8000/health'
+              for i in range(80):
+                  try:
+                      urllib.request.urlopen(url, timeout=5)
+                      print('vLLM server is ready'); break
+                  except Exception as e:
+                      print(f'waiting for vLLM server ({i+1}/80): {e}'); time.sleep(15)
+              else:
+                  raise SystemExit('vLLM server did not become ready in time -- apply this file first and wait for the Deployment rollout')
+              "
+              python3 log_vllm_bench_to_mlflow.py \
+                --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
+                --base-url http://fin-agent-vllm-__NAME__.fin-agent.svc.cluster.local:8000 \
+                --model Qwen/Qwen3-8B \
+                --dataset-name hf \
+                --dataset-path gorilla-llm/Berkeley-Function-Calling-Leaderboard \
+                --bfcl-categories simple,multiple,parallel,parallel_multiple \
+                --num-prompts 100 \
+                --max-concurrency __CONCURRENCY__
+          volumeMounts:
+            - { name: src, mountPath: /src }
+          resources:
+            requests: { cpu: "1", memory: 2Gi, ephemeral-storage: 4Gi }
+            limits: { cpu: "2", memory: 4Gi, ephemeral-storage: 10Gi }
+      volumes:
+        - name: src
+          configMap: { name: fin-agent-vllm-bench-src }

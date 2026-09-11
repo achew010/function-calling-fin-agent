@@ -5,11 +5,13 @@ it for bfcl-eval: run the real tool as a subprocess, point --save-result at a te
 and log every scalar key from the result JSON as an MLflow metric or param.
 
 Key names logged as metrics -- verified against vLLM's own benchmarks/serve.py source,
-not assumed -- include mean/median/std/p99 for ttft_ms, tpot_ms, itl_ms, e2el_ms, plus
-request_throughput, output_throughput, total_token_throughput, completed, failed. Per-
-request raw lists (ttfts, itls, latencies, generated_texts, errors, ...) are skipped --
-MLflow metrics must be scalars, and these are exactly the detail save_to_pytorch_
-benchmark_format's own ignored_metrics list already excludes for the same reason.
+not assumed -- include mean/median/std/p50/p95/p99 for ttft_ms, tpot_ms, itl_ms, e2el_ms
+(this script always passes --metric-percentiles 50,95,99 -- vllm bench serve's own
+default is p99 only), plus request_throughput, output_throughput,
+total_token_throughput, completed, failed. Per-request raw lists (ttfts, itls, latencies,
+generated_texts, errors, ...) are skipped -- MLflow metrics must be scalars, and these
+are exactly the detail save_to_pytorch_benchmark_format's own ignored_metrics list
+already excludes for the same reason.
 
 Usage (against an already-running, OpenAI-compatible vLLM server -- e.g.
 configs/templates/inference/vllm-serve-checkpoint.yaml port-forwarded to localhost:8000,
@@ -90,6 +92,13 @@ def main() -> None:
             "--save-result",
             "--result-dir", str(tmp),
             "--result-filename", result_path.name,
+            # vllm bench serve only computes p99 by default (--metric-percentiles
+            # defaults to "99") -- p50/p95/p99 here so mean/median/p95/p99 all land in
+            # the result JSON (and thus MLflow) without a caller having to remember to
+            # ask for it. A caller-supplied --metric-percentiles in {posargs} still
+            # wins -- argparse takes the last occurrence of a flag, and extra_vllm_args
+            # is appended after this.
+            "--metric-percentiles", "50,95,99",
         ]
         if args.bfcl_categories:
             cmd += ["--bfcl-categories", args.bfcl_categories]

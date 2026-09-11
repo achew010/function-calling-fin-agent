@@ -129,10 +129,11 @@ python run_latency_benchmark.py --endpoint http://localhost:8000/v1 --model Qwen
 
 Runs `vllm`'s own built-in `vllm bench serve` (real tool-calling traffic via its
 `BFCLDataset` loader — see root README's step 5) as a subprocess and logs its
-mean/median/p99 TTFT, TPOT, inter-token latency, and request/output/total-token
+mean/median/p50/p95/p99 TTFT, TPOT, inter-token latency, and request/output/total-token
 throughput to MLflow, under the `fin-agent-vllm-bench` experiment — one run per
 invocation, so a concurrency sweep shows up as directly comparable rows instead of only
-living in `vllm bench serve`'s own local `--save-result` JSON.
+living in `vllm bench serve`'s own local `--save-result` JSON. Always passes
+`--metric-percentiles 50,95,99` (vLLM's own default is p99 only).
 
 ```bash
 python log_vllm_bench_to_mlflow.py \
@@ -144,7 +145,14 @@ python log_vllm_bench_to_mlflow.py \
 Bare-host analogue: `tox -e vllm-bench -- <same flags>` (see `tox.ini`'s
 `[testenv:vllm-bench]`). Requires `kubectl -n fin-agent port-forward svc/mlflow
 5000:5000` running, same as this file's "Evaluating a specific MLflow run against BFCL"
-section below.
+section below — and, separately, a live `kubectl -n fin-agent port-forward svc/
+fin-agent-vllm-<name> 8000:8000` for the vLLM endpoint itself if you're serving via
+`../configs/templates/inference/vllm-serve-checkpoint.yaml`. Both port-forwards have to
+stay running in their own terminals for the whole benchmark; a dead one just produces a
+flat connection-refused error on every request rather than a useful one. Prefer not to
+juggle either: `../configs/templates/inference/vllm-bench-mlflow-checkpoint-job.yaml`
+runs the serve + benchmark + MLflow-logging entirely in-cluster (see root README's step
+5, Option A) — no port-forwarding at all.
 
 ## Evaluating a specific MLflow run against BFCL
 

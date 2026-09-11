@@ -184,9 +184,44 @@ section for both, plus the "just serve it, no eval" variant.
 
 ### 5. vLLM latency benchmark
 
-Serve the checkpoint first — `configs/templates/inference/vllm-serve-checkpoint.yaml`,
-the serve-only Deployment+Service (no BFCL Job, no results PVC) that step 4's manifest
-also bundles:
+Uses `vllm`'s own built-in `BFCLDataset` loader — real tool-calling traffic (BFCL
+categories translated to OpenAI tool schemas), no custom conversion code.
+`--bfcl-categories` narrows it to the same AST-evaluated, single-turn "python" collection
+`run_bfcl_eval.py`'s `TEST_COLLECTION_MAPPING` uses elsewhere in this repo. One thing
+worth knowing regardless: it sends tools via the native `tools`/`tool_choice` API (the
+"-FC" format), whereas this project's fine-tune uses prompting-style tool calls (tools as
+text in the system message — same distinction `run_bfcl_eval.py` is careful about
+elsewhere in this repo) — realistic tool-calling-*shaped* load, not an exact replica of
+this model's actual production request format. Logs mean/median/p50/p95/p99 TTFT, TPOT,
+inter-token latency, and request/output/total-token throughput to MLflow. Each invocation
+is one run — repeat at 1/8/16/24/32 concurrency for the production comparison (see
+"Confirmed constraints" above), they'll show up as separate, directly comparable rows.
+
+**Option A — one manifest, no port-forwarding** (`configs/templates/inference/
+vllm-bench-mlflow-checkpoint-job.yaml`): bundles the same serve-only Deployment+Service
+as Option B below *and* a Job that runs the benchmark and logs to MLflow, both reaching
+each other over their normal in-cluster Service DNS — nothing to port-forward or leave
+running in a spare terminal.
+
+```bash
+sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' -e 's/__CONCURRENCY__/32/g' \
+  configs/templates/inference/vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
+kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
+kubectl -n fin-agent wait --for=condition=complete job/fin-agent-vllm-bench-sft --timeout=1800s
+kubectl -n fin-agent logs -l app=fin-agent-vllm-bench-sft --tail=40
+```
+
+Reapply with a different `__CONCURRENCY__` for each point on the sweep — the Job gets
+deleted/reapplied each time, but the vLLM Deployment is left running between reapplies
+(same teardown discipline as step 4's manifest), so only the fast benchmark step repeats,
+not the checkpoint download. Tear everything down, Deployment included, when done:
+`kubectl -n fin-agent delete -f <(sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id>/g'
+-e 's/__CONCURRENCY__/32/g' configs/templates/inference/vllm-bench-mlflow-checkpoint-job.yaml)`.
+
+**Option B — serve + bench separately** (useful for iterating on benchmark flags without
+re-rolling the Deployment, or running the bench from a bare host): serve the checkpoint
+with `configs/templates/inference/vllm-serve-checkpoint.yaml` (the same serve-only
+Deployment+Service Option A bundles, no BFCL Job, no results PVC):
 
 ```bash
 sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
@@ -195,10 +230,12 @@ kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
 kubectl -n fin-agent port-forward svc/fin-agent-vllm-sft 8000:8000
 ```
 
-Then, in another terminal, `tox -e vllm-bench` — runs `vllm bench serve` and logs its
-TTFT/TPOT/ITL/throughput metrics to MLflow (`2_evaluations/log_vllm_bench_to_mlflow.py`;
-needs `kubectl -n fin-agent port-forward svc/mlflow 5000:5000` running too, same as step 4's
-bare-host path):
+Then, in **another terminal** (the port-forward above must stay running the whole time —
+confirm it's actually up with `curl http://localhost:8000/health` before proceeding, a
+dead/never-started port-forward fails every request with a plain connection-refused
+error, not a useful one), `tox -e vllm-bench` — runs `vllm bench serve` and logs to
+MLflow via `2_evaluations/log_vllm_bench_to_mlflow.py` (also needs `kubectl -n fin-agent
+port-forward svc/mlflow 5000:5000` running in its own terminal):
 
 ```bash
 tox -e vllm-bench -- \
@@ -211,20 +248,6 @@ tox -e vllm-bench -- \
   --max-concurrency 32
 ```
 
-Uses `vllm`'s own built-in `BFCLDataset` loader — real tool-calling traffic (BFCL
-categories translated to OpenAI tool schemas), no custom conversion code.
-`--bfcl-categories` narrows it to the same AST-evaluated, single-turn "python" collection
-`run_bfcl_eval.py`'s `TEST_COLLECTION_MAPPING` uses elsewhere in this repo (drop the flag
-to fall back to the loader's own default mix of `simple`/`live_simple`/`multiple`). One
-thing worth knowing regardless: it sends tools via the native `tools`/`tool_choice` API
-(the "-FC" format), whereas this project's fine-tune uses prompting-style tool calls
-(tools as text in the system message — same distinction `run_bfcl_eval.py` is careful
-about elsewhere in this repo) — realistic tool-calling-*shaped* load, not an exact
-replica of this model's actual production request format. Logs mean/median/p99 TTFT,
-TPOT, inter-token latency, and request/output/total-token throughput as MLflow metrics
-under the `fin-agent-vllm-bench` experiment. Each invocation is one MLflow run — run it
-once per concurrency level you want to compare (1/8/16/24/32 for the production
-comparison, see "Confirmed constraints" above), they'll show up as separate rows.
 (Prefer the plain `vllm bench serve` CLI without MLflow logging? Drop the `tox -e
 vllm-bench --` prefix and pass the same flags directly — see
 `log_vllm_bench_to_mlflow.py`'s docstring for the underlying command it builds.) Tear the
