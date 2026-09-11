@@ -50,6 +50,7 @@ kubectl create configmap fin-agent-bfcl-src -n "${NAMESPACE}" \
   --from-file=run_bfcl_eval.py="${PROJECT_ROOT}/2_evaluations/run_bfcl_eval.py" \
   --from-file=log_bfcl_to_mlflow.py="${PROJECT_ROOT}/2_evaluations/log_bfcl_to_mlflow.py" \
   --from-file=patch_bfcl_qwen_handler.py="${PROJECT_ROOT}/2_evaluations/patch_bfcl_qwen_handler.py" \
+  --from-file=summarize_bfcl_errors.py="${PROJECT_ROOT}/2_evaluations/summarize_bfcl_errors.py" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create configmap fin-agent-vllm-bench-src -n "${NAMESPACE}" \
