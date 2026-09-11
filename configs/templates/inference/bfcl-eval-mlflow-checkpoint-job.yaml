@@ -174,8 +174,10 @@ metadata:
 spec:
   # backoffLimit 0 + restartPolicy Never: on BackoffLimitExceeded the job controller
   # deletes the failed pod and its logs go with it, leaving nothing to debug from. A
-  # failed pod left in Error state is worth more than an automatic retry here; the PVC
-  # still lets bfcl generate resume completed cases on a manual rerun.
+  # failed pod left in Error state is worth more than an automatic retry here. Every run
+  # (including a manual rerun) starts from a clean /data/bfcl-__NAME__ -- see the
+  # `rm -rf` below -- so bfcl generate never resumes from a prior run's (possibly
+  # broken) results.
   backoffLimit: 0
   template:
     metadata:
@@ -205,7 +207,7 @@ spec:
               else:
                   raise SystemExit('vLLM server did not become ready in time — apply this file first and wait for the Deployment rollout')
               "
-              mkdir -p /data/bfcl-__NAME__
+              rm -rf /data/bfcl-__NAME__ && mkdir -p /data/bfcl-__NAME__
               for category in __TEST_CATEGORIES__; do
                 echo "--- category: ${category} ---"
                 python3 log_bfcl_to_mlflow.py \

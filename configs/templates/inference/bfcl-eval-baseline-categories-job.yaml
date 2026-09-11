@@ -45,7 +45,9 @@ spec:
   # setup: on BackoffLimitExceeded the job controller deletes the failed pod, and its
   # logs go with it -- which is exactly what happened the first time this ran, leaving
   # nothing to debug from. A single failed pod left in Error state is worth more here
-  # than an automatic retry; bfcl generate still resumes from the PVC on a manual rerun.
+  # than an automatic retry. Every run (including a manual rerun) starts from a clean
+  # /data/bfcl-qwen3-8b -- see the `rm -rf` below -- so bfcl generate never resumes from
+  # a prior run's (possibly broken) results.
   backoffLimit: 0
   template:
     metadata:
@@ -75,7 +77,7 @@ spec:
               else:
                   raise SystemExit('vLLM server did not become ready in time — apply ../inference/vllm-qwen3-8b.yaml first')
               "
-              mkdir -p /data/bfcl-qwen3-8b
+              rm -rf /data/bfcl-qwen3-8b && mkdir -p /data/bfcl-qwen3-8b
               for category in __TEST_CATEGORIES__; do
                 echo "--- category: ${category} ---"
                 python3 log_bfcl_to_mlflow.py \

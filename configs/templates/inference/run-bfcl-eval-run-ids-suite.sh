@@ -38,13 +38,10 @@
 #      train_grpo.py with --mlflow both log one) -- these are NOT produced by this
 #      script, only consumed.
 #
-# Each leg's /data/bfcl-<name> directory on fin-agent-bfcl-mlflow-results is wiped right
-# before that leg's Job starts (see clear_bfcl_cache below) -- bfcl generate resumes from
-# whatever result files it finds there by default, so a rerun without this would silently
-# skip already-"completed" cases (including ones that errored out against a bad server
-# config) instead of regenerating them. This also means a killed FULL_SCALE run (hours)
-# can no longer be resumed by just rerunning the script -- set CLEAR_CACHE=0 to keep the
-# old behavior for that case.
+# Each leg's Job clears its own /data/bfcl-<name> results directory before running bfcl
+# generate (see bfcl-eval-baseline-categories-job.yaml / bfcl-eval-mlflow-checkpoint-job.yaml)
+# -- otherwise bfcl generate resumes from whatever result files are already there,
+# silently skipping cases from a prior (possibly broken) run instead of regenerating them.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,25 +65,8 @@ if [ "${FULL_SCALE:-0}" = "1" ]; then
   echo ">> FULL_SCALE=1: evaluating every model on the full 'python' category (hours per model, not minutes)"
 fi
 
-# Set to 0 to keep bfcl generate's own resume-from-existing-results behavior instead
-# (e.g. to pick a killed FULL_SCALE run back up rather than pay for it again).
-CLEAR_CACHE="${CLEAR_CACHE:-1}"
-
-clear_bfcl_cache() {
-  local subdir="$1"   # e.g. bfcl-sft -- matches --bfcl-project-root /data/${subdir} in
-                       # the Job manifests below.
-  if [ "${CLEAR_CACHE}" != "1" ]; then
-    return
-  fi
-  echo ">> clearing cached BFCL results + MLflow run-id at /data/${subdir}"
-  kubectl -n "${NAMESPACE}" delete pod "bfcl-clear-${subdir}" --ignore-not-found --wait=true
-  kubectl -n "${NAMESPACE}" run "bfcl-clear-${subdir}" --image=busybox --restart=Never --rm --attach \
-    --overrides="{\"spec\":{\"containers\":[{\"name\":\"bfcl-clear-${subdir}\",\"image\":\"busybox\",\"command\":[\"sh\",\"-c\",\"rm -rf /data/${subdir} && echo cleared\"],\"volumeMounts\":[{\"name\":\"data\",\"mountPath\":\"/data\"}]}],\"volumes\":[{\"name\":\"data\",\"persistentVolumeClaim\":{\"claimName\":\"fin-agent-bfcl-mlflow-results\"}}]}}"
-}
-
 run_baseline() {
   echo ">> [baseline] Qwen/Qwen3-8B (no fine-tuning)"
-  clear_bfcl_cache bfcl-qwen3-8b
   kubectl -n "${NAMESPACE}" delete job fin-agent-bfcl-eval-qwen3-8b --ignore-not-found --wait=true
   kubectl -n "${NAMESPACE}" delete deployment fin-agent-vllm-qwen3-8b --ignore-not-found --wait=true
   kubectl apply -f "${SCRIPT_DIR}/vllm-qwen3-8b.yaml"
@@ -101,7 +81,6 @@ run_baseline() {
 run_mlflow_checkpoint() {
   local name="$1" run_id="$2"
   echo ">> [${name}] MLflow run_id=${run_id}"
-  clear_bfcl_cache "bfcl-${name}"
   local rendered
   rendered="$(sed -e "s/__NAME__/${name}/g" -e "s/__RUN_ID__/${run_id}/g" -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" \
     "${SCRIPT_DIR}/bfcl-eval-mlflow-checkpoint-job.yaml")"
