@@ -35,6 +35,24 @@ from typing import Any
 
 from bfcl_eval.constants.category_mapping import TEST_COLLECTION_MAPPING, TEST_FILE_MAPPING
 from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
+from bfcl_eval.model_handler.local_inference.qwen import QwenHandler
+
+# QwenHandler._format_prompt hand-builds the raw-completions prompt bfcl-eval sends to
+# /v1/completions (never /v1/chat/completions -- confirmed against base_oss_handler.py's
+# _query_prompting, the only query path local OSS handlers, Prompt or FC, have). Its own
+# docstring quotes Qwen3's real chat template, which appends "<think>\n\n</think>\n\n"
+# right after "<|im_start|>assistant\n" when enable_thinking=False -- but the Python
+# implementation below that docstring never does this. Since /v1/completions has no chat
+# template stage at all, nothing else suppresses Qwen3's default reasoning behavior, and
+# the model emits an unclosed leading <think> that breaks BFCL's parser -- confirmed
+# against a real BFCL_v3_live_parallel_result.json entry:
+# "<think>\n[get_current_weather(location='Boston, MA'), ...]" (correct call, unparseable
+# because of the leaked tag). Patched here, in project code, rather than in the pinned
+# bfcl-eval package itself, since the Job container reinstalls it fresh every run.
+_format_prompt = QwenHandler._format_prompt
+QwenHandler._format_prompt = lambda self, messages, function: (
+    _format_prompt(self, messages, function) + "<think>\n\n</think>\n\n"
+)
 
 
 class Evaluator(ABC):
