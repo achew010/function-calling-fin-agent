@@ -62,6 +62,22 @@ spec:
           # Prompt-style handler calls the raw /v1/completions endpoint with a
           # hand-built prompt, never /v1/chat/completions, so no chat template (and
           # therefore no enable_thinking) is ever involved in this path at all.
+          # --enable-auto-tool-choice --tool-call-parser qwen3_xml --default-chat-
+          # template-kwargs enable_thinking=false: only affect /v1/chat/completions
+          # (BFCL's raw-completions Prompt-style eval above calls /v1/completions, which
+          # has no chat-template/tool-choice stage at all -- confirmed against vllm's own
+          # serving code -- so these are additive, not a behavior change for that path).
+          # Needed for anything hitting this server over /v1/chat/completions instead,
+          # e.g. `vllm bench serve --dataset-name hf --dataset-path gorilla-llm/
+          # Berkeley-Function-Calling-Leaderboard` (see root README's step 5): its
+          # BFCLDataset loader attaches real tools/tool_choice, which vLLM otherwise
+          # rejects with a 400 ('"auto" tool choice requires --enable-auto-tool-choice
+          # and --tool-call-parser to be set' -- confirmed for real). qwen3_xml matches
+          # Qwen3's native <tool_call>{"name":...,"arguments":...}</tool_call> format
+          # (verified against vllm's tool_parsers/__init__.py registry) -- unlike the
+          # fine-tuned checkpoints (../inference/vllm-serve-checkpoint.yaml), this raw
+          # baseline was never trained away from that format, so it can genuinely
+          # produce real native tool calls here.
           command:
             - sh
             - -c
@@ -70,6 +86,9 @@ spec:
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
               --max-model-len 40960
+              --enable-auto-tool-choice
+              --tool-call-parser qwen3_xml
+              --default-chat-template-kwargs '{"enable_thinking": false}'
               --host 0.0.0.0 --port 8000
           env:
             - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
