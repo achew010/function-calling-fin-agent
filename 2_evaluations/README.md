@@ -131,16 +131,20 @@ Runs `vllm`'s own built-in `vllm bench serve` (real tool-calling traffic via its
 `BFCLDataset` loader — see root README's step 5) as a subprocess and logs its
 mean/median/p50/p95/p99 TTFT, TPOT, inter-token latency, and request/output/total-token
 throughput to MLflow, under the `fin-agent-vllm-bench` experiment — one run per
-invocation, so a concurrency sweep shows up as directly comparable rows instead of only
-living in `vllm bench serve`'s own local `--save-result` JSON. Always passes
+concurrency level, so a sweep shows up as directly comparable rows instead of only living
+in `vllm bench serve`'s own local `--save-result` JSON. Always passes
 `--metric-percentiles 50,95,99` (vLLM's own default is p99 only).
 
 ```bash
 python log_vllm_bench_to_mlflow.py \
   --mlflow-tracking-uri http://localhost:5000 \
   --base-url http://localhost:8000 --model Qwen/Qwen3-8B \
-  --bfcl-categories simple,multiple,parallel,parallel_multiple --max-concurrency 32
+  --bfcl-categories simple,multiple,parallel,parallel_multiple --concurrencies 16,32,64
 ```
+
+`--concurrencies` (comma-separated) runs the full benchmark once per value in one
+invocation; `--max-concurrency <n>` runs a single level instead — pass exactly one of the
+two.
 
 Bare-host analogue: `tox -e vllm-bench -- <same flags>` (see `tox.ini`'s
 `[testenv:vllm-bench]`). Requires `kubectl -n fin-agent port-forward svc/mlflow

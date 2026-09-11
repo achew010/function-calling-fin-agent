@@ -27,6 +27,16 @@ Any extra arguments (e.g. --seed, --request-rate) are passed straight through to
 `vllm bench serve` unmodified. Run once per concurrency level you want to compare (e.g.
 1/8/16/24/32, see root README's "Confirmed constraints") -- each invocation is logged as
 its own MLflow run so they show up as separate, directly comparable rows.
+
+To sweep several concurrency levels in one command, use --concurrencies (comma-separated)
+instead of --max-concurrency -- runs `vllm bench serve` once per value, still one MLflow
+run each:
+    python log_vllm_bench_to_mlflow.py \
+        --mlflow-tracking-uri http://localhost:5000 \
+        --base-url http://localhost:8000 --model Qwen/Qwen3-8B \
+        --dataset-name hf --dataset-path gorilla-llm/Berkeley-Function-Calling-Leaderboard \
+        --bfcl-categories simple,multiple,parallel,parallel_multiple \
+        --num-prompts 100 --concurrencies 16,32,64
 """
 
 from __future__ import annotations
@@ -74,9 +84,31 @@ def main() -> None:
         "(this project's AST-evaluated 'python' BFCL scope) is the usual choice here.",
     )
     parser.add_argument("--num-prompts", type=int, default=100)
-    parser.add_argument("--max-concurrency", type=int, required=True)
+    parser.add_argument("--max-concurrency", type=int, default=None, help="Single concurrency level. Mutually exclusive with --concurrencies.")
+    parser.add_argument(
+        "--concurrencies",
+        default=None,
+        help="Comma-separated concurrency levels (e.g. 16,32,64) -- runs the full "
+        "benchmark once per value, each its own MLflow run. Mutually exclusive with "
+        "--max-concurrency.",
+    )
     args, extra_vllm_args = parser.parse_known_args()
 
+    if (args.max_concurrency is None) == (args.concurrencies is None):
+        raise SystemExit("pass exactly one of --max-concurrency or --concurrencies")
+    concurrencies = (
+        [args.max_concurrency] if args.concurrencies is None
+        else [int(c) for c in args.concurrencies.split(",") if c.strip()]
+    )
+
+    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    mlflow.set_experiment(args.mlflow_experiment_name)
+
+    for concurrency in concurrencies:
+        run_once(args, concurrency, extra_vllm_args)
+
+
+def run_once(args: argparse.Namespace, concurrency: int, extra_vllm_args: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         result_path = Path(tmp) / "result.json"
         cmd = [
@@ -88,7 +120,7 @@ def main() -> None:
             "--dataset-name", args.dataset_name,
             "--dataset-path", args.dataset_path,
             "--num-prompts", str(args.num_prompts),
-            "--max-concurrency", str(args.max_concurrency),
+            "--max-concurrency", str(concurrency),
             "--save-result",
             "--result-dir", str(tmp),
             "--result-filename", result_path.name,
@@ -119,9 +151,6 @@ def main() -> None:
 
         result = json.loads(result_path.read_text())
 
-    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-    mlflow.set_experiment(args.mlflow_experiment_name)
-
     with mlflow.start_run() as run:
         mlflow.log_param("base_url", args.base_url)
         for key, value in result.items():
@@ -135,8 +164,8 @@ def main() -> None:
                 mlflow.log_metric(key, value)
             # anything else (nested dict/list not covered above) is skipped rather than
             # guessed at -- e.g. a future vllm version adding a new structured field.
-        mlflow.set_tag("max_concurrency", args.max_concurrency)
-        print(f"[log_vllm_bench_to_mlflow] logged to MLflow run {run.info.run_id}")
+        mlflow.set_tag("max_concurrency", concurrency)
+        print(f"[log_vllm_bench_to_mlflow] concurrency={concurrency} logged to MLflow run {run.info.run_id}")
 
 
 if __name__ == "__main__":
