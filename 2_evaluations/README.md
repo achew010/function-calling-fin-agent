@@ -130,9 +130,7 @@ python run_latency_benchmark.py --endpoint http://localhost:8000/v1 --model Qwen
 Runs `vllm`'s own built-in `vllm bench serve` (real tool-calling traffic via its
 `BFCLDataset` loader — see root README's step 5) as a subprocess and logs its
 mean/median/p50/p95/p99 TTFT, TPOT, inter-token latency, and request/output/total-token
-throughput to MLflow, under the `fin-agent-vllm-bench` experiment — one run per
-concurrency level, so a sweep shows up as directly comparable rows instead of only living
-in `vllm bench serve`'s own local `--save-result` JSON. Always passes
+throughput to MLflow, under the `fin-agent-vllm-bench` experiment. Always passes
 `--metric-percentiles 50,95,99` (vLLM's own default is p99 only).
 
 ```bash
@@ -142,9 +140,16 @@ python log_vllm_bench_to_mlflow.py \
   --bfcl-categories simple,multiple,parallel,parallel_multiple --concurrencies 16,32,64
 ```
 
-`--concurrencies` (comma-separated) runs the full benchmark once per value in one
-invocation; `--max-concurrency <n>` runs a single level instead — pass exactly one of the
-two.
+`--max-concurrency <n>` runs a single level, logged as its own run with plain
+(unprefixed) metric/param names. `--concurrencies` (comma-separated) sweeps several
+levels — runs the full benchmark once per value but logs them all into **one** MLflow
+run, each value's fields prefixed `c<N>_` (e.g. `c32_mean_ttft_ms`) so they sit side by
+side instead of colliding. The prefix isn't cosmetic: MLflow params are immutable per
+key, so logging the same unprefixed key twice with a different value (e.g. `date`,
+which differs every `vllm bench serve` invocation) raises `INVALID_PARAMETER_VALUE` on
+the second concurrency — the same class of bug `log_bfcl_to_mlflow.py` already works
+around for multi-category runs. Pass exactly one of `--max-concurrency` /
+`--concurrencies`.
 
 Bare-host analogue: `tox -e vllm-bench -- <same flags>` (see `tox.ini`'s
 `[testenv:vllm-bench]`). Requires `kubectl -n fin-agent port-forward svc/mlflow

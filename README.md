@@ -231,8 +231,10 @@ tox -e vllm-bench -- \
   --concurrencies 16,32,64
 ```
 
-(`--concurrencies` runs the whole benchmark once per value in one command, each still
-logged as its own MLflow run — swap in `--max-concurrency 32` instead for a single level.)
+(`--concurrencies` runs the whole benchmark once per value, all logged into a single
+MLflow run with each value's metrics/params prefixed `c<N>_` — e.g. `c32_mean_ttft_ms` —
+so they sit side by side. Swap in `--max-concurrency 32` instead for a single level,
+logged unprefixed as its own run.)
 
 Logs mean/median/p50/p95/p99 TTFT, TPOT, inter-token latency, and request/output/total-
 token throughput to MLflow. Uses `vllm`'s own built-in `BFCLDataset` loader — real

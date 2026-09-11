@@ -24,13 +24,17 @@ see root README's step 5):
         --num-prompts 100 --max-concurrency 32
 
 Any extra arguments (e.g. --seed, --request-rate) are passed straight through to
-`vllm bench serve` unmodified. Run once per concurrency level you want to compare (e.g.
-1/8/16/24/32, see root README's "Confirmed constraints") -- each invocation is logged as
-its own MLflow run so they show up as separate, directly comparable rows.
+`vllm bench serve` unmodified. Pass --max-concurrency for a single level (e.g. one point
+on the 1/8/16/24/32 production comparison, see root README's "Confirmed constraints") --
+logged as its own MLflow run, with plain (unprefixed) metric/param names.
 
-To sweep several concurrency levels in one command, use --concurrencies (comma-separated)
-instead of --max-concurrency -- runs `vllm bench serve` once per value, still one MLflow
-run each:
+To sweep several levels into ONE MLflow run, use --concurrencies (comma-separated)
+instead of --max-concurrency -- runs `vllm bench serve` once per value, all logged into
+the same run with each value's metrics/params prefixed "c<N>_" (e.g. c32_mean_ttft_ms) so
+they sit side by side instead of colliding -- MLflow params are immutable per key, so
+logging the same unprefixed key twice with a different value (e.g. "date") would raise
+INVALID_PARAMETER_VALUE on the second concurrency, the same class of bug
+log_bfcl_to_mlflow.py already had to work around for multi-category runs:
     python log_vllm_bench_to_mlflow.py \
         --mlflow-tracking-uri http://localhost:5000 \
         --base-url http://localhost:8000 --model Qwen/Qwen3-8B \
@@ -104,11 +108,20 @@ def main() -> None:
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     mlflow.set_experiment(args.mlflow_experiment_name)
 
-    for concurrency in concurrencies:
-        run_once(args, concurrency, extra_vllm_args)
+    # One run for the whole sweep -- multi-value only, so a plain single-concurrency
+    # call keeps the simple unprefixed metric names it always had.
+    prefix_each = len(concurrencies) > 1
+    with mlflow.start_run() as run:
+        mlflow.log_param("base_url", args.base_url)
+        if prefix_each:
+            mlflow.set_tag("concurrencies", ",".join(str(c) for c in concurrencies))
+        for concurrency in concurrencies:
+            prefix = f"c{concurrency}_" if prefix_each else ""
+            run_once(args, concurrency, extra_vllm_args, prefix)
+        print(f"[log_vllm_bench_to_mlflow] logged to MLflow run {run.info.run_id}")
 
 
-def run_once(args: argparse.Namespace, concurrency: int, extra_vllm_args: list[str]) -> None:
+def run_once(args: argparse.Namespace, concurrency: int, extra_vllm_args: list[str], prefix: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         result_path = Path(tmp) / "result.json"
         cmd = [
@@ -151,21 +164,20 @@ def run_once(args: argparse.Namespace, concurrency: int, extra_vllm_args: list[s
 
         result = json.loads(result_path.read_text())
 
-    with mlflow.start_run() as run:
-        mlflow.log_param("base_url", args.base_url)
-        for key, value in result.items():
-            if key in LIST_VALUED_KEYS:
-                continue
-            if key in PARAM_STRING_KEYS or isinstance(value, str):
-                mlflow.log_param(key, value)
-            elif isinstance(value, bool) or value is None:
-                mlflow.log_param(key, value)
-            elif isinstance(value, (int, float)):
-                mlflow.log_metric(key, value)
-            # anything else (nested dict/list not covered above) is skipped rather than
-            # guessed at -- e.g. a future vllm version adding a new structured field.
+    for key, value in result.items():
+        if key in LIST_VALUED_KEYS:
+            continue
+        if key in PARAM_STRING_KEYS or isinstance(value, str):
+            mlflow.log_param(f"{prefix}{key}", value)
+        elif isinstance(value, bool) or value is None:
+            mlflow.log_param(f"{prefix}{key}", value)
+        elif isinstance(value, (int, float)):
+            mlflow.log_metric(f"{prefix}{key}", value)
+        # anything else (nested dict/list not covered above) is skipped rather than
+        # guessed at -- e.g. a future vllm version adding a new structured field.
+    if not prefix:
         mlflow.set_tag("max_concurrency", concurrency)
-        print(f"[log_vllm_bench_to_mlflow] concurrency={concurrency} logged to MLflow run {run.info.run_id}")
+    print(f"[log_vllm_bench_to_mlflow] concurrency={concurrency} logged (prefix={prefix!r})")
 
 
 if __name__ == "__main__":
