@@ -197,10 +197,21 @@ new pod stuck `Pending`, so check for and clear those too, not just `fin-agent-v
 kubectl -n fin-agent get deployments -l 'app in (fin-agent-vllm-sft,fin-agent-vllm-grpo,fin-agent-vllm-qwen3-8b)'
 kubectl -n fin-agent delete deployment fin-agent-vllm-sft fin-agent-vllm-grpo fin-agent-vllm-qwen3-8b --ignore-not-found --wait=true
 kubectl -n fin-agent delete service fin-agent-vllm-sft fin-agent-vllm-grpo fin-agent-vllm-qwen3-8b --ignore-not-found
-sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
+sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' -e 's/__VLLM_EXTRA_ARGS__//g' \
   configs/templates/inference/vllm-serve-checkpoint.yaml | kubectl apply -f -
 kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
 kubectl -n fin-agent get pods -l app=fin-agent-vllm-sft   # confirm one pod, freshly created
+```
+
+To benchmark a **quantized** server instead, substitute the quantization flag and use a
+distinct `__NAME__` so it doesn't collide with the unquantized Deployment (everything
+below then targets `fin-agent-vllm-sft-fp8`):
+
+```bash
+sed -e 's/__NAME__/sft-fp8/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
+  -e 's/__VLLM_EXTRA_ARGS__/--quantization fp8_per_tensor/g' \
+  configs/templates/inference/vllm-serve-checkpoint.yaml | kubectl apply -f -
+kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-fp8 --timeout=900s
 ```
 
 **2. Kill any stale local port-forwards, then start fresh ones — each in its own
