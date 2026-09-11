@@ -1,0 +1,45 @@
+# Data
+datasets>=2.19.0
+scikit-learn>=1.4.0
+
+# Training
+transformers>=4.44.0
+peft>=0.12.0
+trl>=0.15.0   # GRPOTrainer's chat_template_kwargs support (1_training/2_grpo/) needs a
+              # recent trl; verified end-to-end (config construction, reward-function
+              # contract) against trl==1.12.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.0
+mlflow>=2.14.0   # optional — only needed when running 1_training/1_sft/train_sft.py with --mlflow
+
+# Evaluation
+bfcl-eval==2025.8.6.2   # PINNED, not a floor: bfcl-eval's internal constants module
+            # (bfcl_eval.constants.category_mapping, imported directly by
+            # run_bfcl_eval.py/log_bfcl_to_mlflow.py) is not a stable API across
+            # releases — 2026.3.23 removed TEST_FILE_MAPPING entirely, breaking the
+            # import outright (hit this for real running an unpinned install in
+            # production). Re-verify category_mapping.py's contents before bumping.
+            # A real BFCL_v4 upgrade (bfcl-eval>=2025.8.25) was investigated and reverted:
+            # every BFCL_v4 release hard-pins faiss-cpu==1.11.0 (no `extra ==` marker, so
+            # it's unconditional even though we'd never touch its memory-backend feature),
+            # and that exact faiss-cpu version has zero Linux manylinux wheels for any
+            # Python version (checked 3.9-3.13, and every bfcl-eval release from the first
+            # BFCL_v4 one through the latest 2026.3.23 pypi has this same pin) — pip
+            # install fails outright in our python:3.12-slim (Linux) containers. Confirmed
+            # via direct wheel inspection, not assumed. Revisit if faiss-cpu ever ships a
+            # working Linux wheel for 1.11.0, or bfcl-eval relaxes the pin.
+            # Also pins numpy==1.26.4; on Python 3.13+ the scipy version pip resolves
+            # needs numpy>=2.0, and no numpy<2.0-compatible scipy wheel exists yet for
+            # very new Python versions (building one from source needs a Fortran
+            # compiler). If you hit this, prefer Python <=3.12 over fighting the resolver.
+soundfile   # undeclared transitive dep of bfcl-eval's qwen_agent import; installing
+            # bfcl-eval alone raises ModuleNotFoundError on soundfile at import time
+openai>=1.40.0
+aiohttp>=3.9.0
+
+# Serving
+vllm>=0.5.4
+
+huggingface_hub>=0.24.0
+python-dotenv>=1.0.0
+jinja2>=3.1.0   # needed by tokenizer.apply_chat_template (0_data/dataset_walkthrough.ipynb)
