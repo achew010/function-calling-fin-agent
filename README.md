@@ -178,9 +178,29 @@ MODELS="sft" SFT_RUN_ID=<run_id from step 2> \
 Defaults to a cheap smoke pass; add `FULL_SCALE=1` for the real, leaderboard-comparable
 `python` category (hours, not minutes). `MODELS="baseline sft grpo"` runs all three
 (`GRPO_RUN_ID` for step 3's run_id). Logs `bfcl_non_live_ast_accuracy`/
-`bfcl_live_ast_accuracy` to MLflow. A bare-host (no-kube) path also exists via `tox -e
-bfcl` — see `2_evaluations/README.md`'s "Evaluating a specific MLflow run against BFCL"
-section for both, plus the "just serve it, no eval" variant.
+`bfcl_live_ast_accuracy` to MLflow, plus per-cause failure counts and a
+`bfcl_diagnosis.md` artifact saying where the losses are and what to do about them. A
+bare-host (no-kube) path also exists via `tox -e bfcl` — see `2_evaluations/README.md`'s
+"Evaluating a specific MLflow run against BFCL" section for both, plus the "just serve
+it, no eval" variant.
+
+**Quantized parity check.** `QUANTIZATION` serves the same artifacts through vLLM's
+online (load-time) quantization, so no separate checkpoint is needed:
+
+```bash
+QUANTIZATION=fp8_per_tensor FULL_SCALE=1 MODELS="baseline sft" \
+  SFT_RUN_ID=<run_id from step 2> \
+  ./configs/templates/inference/run-bfcl-eval-run-ids-suite.sh
+```
+
+Every identifier gets a suffix (`-fp8-per-tensor`) — Deployment, Service, Job, results
+directory and MLflow experiment — so quantized results sit *beside* the bf16 numbers
+they're meant to be compared against rather than overwriting them. Each run also records
+a `quantization` param and tag (`none` for unquantized), so the two are groupable in
+MLflow by one key instead of by reading experiment-name suffixes. Read the deltas against
+the noise band rather than as exact numbers: at 3491 cases that's roughly ±1.6 pts on
+Non-Live and ±1.7 on Live. If the image rejects `fp8_per_tensor`, plain `fp8` is the
+older, broadly-supported spelling of the same thing.
 
 ### 5. vLLM latency benchmark
 
@@ -253,6 +273,21 @@ tool-calling traffic, no custom conversion code — but sends tools via the nati
 `tools`/`tool_choice` API, whereas this project's fine-tune uses prompting-style tool
 calls (tools as text in the system message); realistic tool-calling-*shaped* load, not an
 exact replica of this model's production request format.
+
+**Comparing quantized against bf16.** Run the sweep twice — once against the bf16
+Deployment, once against the FP8 one from step 1 — labelling each so the two runs are
+distinguishable in MLflow:
+
+```bash
+# ... --base-url http://localhost:8000 (whichever server is port-forwarded) ...
+  --concurrencies 1,8,16,32,64 --label bf16          # then --label fp8_per_tensor
+```
+
+Keep `--gpu-memory-utilization` identical (0.5) across both or the comparison confounds
+two variables. Expect the gain at *high* concurrency rather than in single-stream
+latency: FP8 weights free roughly 8GB, which at a fixed 0.5 utilisation grows the
+KV-cache pool by about a third, so it shows up as sustained throughput at 32–64
+concurrency, not as a lower TTFT at 1.
 
 Tear the Deployment down when done:
 `kubectl -n fin-agent delete deployment fin-agent-vllm-sft && kubectl -n fin-agent delete
