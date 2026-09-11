@@ -226,6 +226,16 @@ def main() -> None:
         "no source run.",
     )
     parser.add_argument(
+        "--quantization",
+        default=None,
+        help="vLLM quantization method the server under evaluation was started with "
+        "(e.g. fp8_per_tensor), or omit for an unquantized run. Logged as both a param "
+        "and a tag so a quantization parity check is filterable/groupable in MLflow "
+        "rather than only inferable from a suffixed experiment name. Unquantized runs "
+        "record 'none' explicitly -- an absent tag is awkward to query, and the whole "
+        "point is comparing the two side by side.",
+    )
+    parser.add_argument(
         "--failure-samples",
         type=int,
         default=3,
@@ -291,6 +301,11 @@ def main() -> None:
             if args.model_source_run_id:
                 mlflow.log_param("model_source_run_id", args.model_source_run_id)
                 mlflow.set_tag("model_source_run_id", args.model_source_run_id)
+            # Always recorded, "none" included: a parity check is a comparison between
+            # two runs, so both sides have to be selectable by the same key.
+            quantization = args.quantization or "none"
+            mlflow.log_param("quantization", quantization)
+            mlflow.set_tag("quantization", quantization)
             # Which leaderboard row this run is actually the analogue of (FC and Prompt
             # are tracked as separate rows with different scores, e.g. Qwen3-8B (FC) vs.
             # Qwen3-8B (Prompt)) and which bfcl-eval build produced these numbers -- both

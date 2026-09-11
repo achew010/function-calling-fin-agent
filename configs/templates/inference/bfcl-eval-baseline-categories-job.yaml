@@ -89,7 +89,7 @@ spec:
                   --vllm-endpoint fin-agent-vllm-qwen3-8b__VARIANT__.fin-agent.svc.cluster.local --vllm-port 8000 \
                   --bfcl-project-root /data/bfcl-qwen3-8b__VARIANT__ \
                   --mlflow-tracking-uri http://mlflow.fin-agent.svc.cluster.local:5000 \
-                  --mlflow-experiment-name fin-agent-bfcl__VARIANT__ \
+                  --mlflow-experiment-name fin-agent-bfcl__VARIANT__ __QUANTIZATION_FLAG__ \
                   --run-id-file /data/bfcl-qwen3-8b__VARIANT__/mlflow_run_id.txt
               done
           volumeMounts:

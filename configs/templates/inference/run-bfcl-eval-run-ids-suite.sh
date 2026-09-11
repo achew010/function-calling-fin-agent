@@ -86,9 +86,15 @@ fi
 # be compared against. Underscores are not legal in Kubernetes object names, hence the tr.
 QUANTIZATION="${QUANTIZATION:-}"
 VLLM_EXTRA_ARGS=""
+QUANTIZATION_FLAG=""
 VARIANT=""
 if [ -n "${QUANTIZATION}" ]; then
   VLLM_EXTRA_ARGS="--quantization ${QUANTIZATION}"
+  # Same method name, two destinations: the vLLM server (how the model is served) and
+  # log_bfcl_to_mlflow.py (which records it as an MLflow param+tag, so the parity check
+  # is filterable rather than only inferable from the suffixed experiment name).
+  # Unquantized runs still record quantization="none" -- log_bfcl_to_mlflow.py's default.
+  QUANTIZATION_FLAG="--quantization ${QUANTIZATION}"
   VARIANT="-$(printf '%s' "${QUANTIZATION}" | tr '_' '-')"
   echo ">> QUANTIZATION=${QUANTIZATION}: serving quantized, results suffixed '${VARIANT}'"
 fi
@@ -119,6 +125,7 @@ run_baseline() {
   fi
   kubectl -n "${NAMESPACE}" rollout status "deploy/fin-agent-vllm-${name}" --timeout=900s
   sed -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" -e "s/__VARIANT__/${VARIANT}/g" \
+    -e "s|__QUANTIZATION_FLAG__|${QUANTIZATION_FLAG}|g" \
     "${SCRIPT_DIR}/bfcl-eval-baseline-categories-job.yaml" | kubectl apply -f -
   kubectl -n "${NAMESPACE}" wait --for=condition=complete "job/fin-agent-bfcl-eval-${name}" --timeout="${WAIT_TIMEOUT}"
   kubectl -n "${NAMESPACE}" logs -l "app=fin-agent-bfcl-eval-${name}" --tail=20
@@ -136,6 +143,7 @@ run_mlflow_checkpoint() {
   rendered="$(sed -e "s/__NAME__/${name}/g" -e "s/__RUN_ID__/${run_id}/g" \
     -e "s/__TEST_CATEGORIES__/${TEST_CATEGORIES}/g" \
     -e "s|__VLLM_EXTRA_ARGS__|${VLLM_EXTRA_ARGS}|g" \
+    -e "s|__QUANTIZATION_FLAG__|${QUANTIZATION_FLAG}|g" \
     "${SCRIPT_DIR}/bfcl-eval-mlflow-checkpoint-job.yaml")"
   kubectl -n "${NAMESPACE}" delete job "fin-agent-bfcl-eval-${name}" --ignore-not-found --wait=true
   kubectl -n "${NAMESPACE}" delete deployment "fin-agent-vllm-${name}" --ignore-not-found --wait=true
