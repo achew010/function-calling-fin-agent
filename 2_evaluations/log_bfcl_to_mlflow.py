@@ -32,7 +32,15 @@ from pathlib import Path
 import mlflow
 
 from run_bfcl_eval import BFCLEvaluator
-from summarize_bfcl_errors import collect, error_type_counts, render_report
+from summarize_bfcl_errors import (
+    categories_csv,
+    collect,
+    error_type_counts,
+    failures_csv,
+    render_diagnosis,
+    render_report,
+    root_cause_counts,
+)
 
 # The public leaderboard's own headline "Overall Acc" is a composite across five domains
 # (Agentic, Multi-Turn, Single-Turn/AST, Hallucination, Format Sensitivity), with Agentic
@@ -74,7 +82,9 @@ LEADERBOARD_QWEN3_8B_REFERENCE = {
 }
 
 
-def log_failure_detail(bfcl_project_root: Path, model: str, samples: int = 3) -> None:
+def log_failure_detail(
+    bfcl_project_root: Path, model: str, samples: int = 3, source_run_id: str | None = None
+) -> None:
     """Log everything the run produced beyond the headline accuracy: per-error-type
     failure counts as metrics, the rendered error report, and the raw generation/score
     files themselves as artifacts.
@@ -102,7 +112,25 @@ def log_failure_detail(bfcl_project_root: Path, model: str, samples: int = 3) ->
             mlflow.log_metric(f"bfcl_error_{group_slug}_{error_slug}", count)
         mlflow.log_metric(f"bfcl_failures_{group_slug}", sum(counter.values()))
 
+    # Root causes, not wrappers: the parallel checkers report every mismatch as
+    # cannot_find_match and bury the real reason in a nested sub_error_type, so the
+    # bfcl_error_* series above can show one flat bucket for several unrelated problems.
+    # These are the numbers to compare across runs.
+    for group, counter in root_cause_counts(by_group).items():
+        group_slug = "live" if group == "Live" else "non_live"
+        for cause, count in counter.items():
+            mlflow.log_metric(f"bfcl_cause_{group_slug}_{re.sub(r'[^A-Za-z0-9_.\-]', '_', cause)}", count)
+
+    # Everything below renders inline in MLflow's own artifact viewer: .md as markdown,
+    # .txt as text, .csv as a sortable table. The raw dirs logged after them are JSON
+    # Lines (one JSON object per line, not one document per file), which that viewer
+    # can't parse -- they're there to be downloaded, and these are there to be read.
     mlflow.log_text(render_report(by_group, samples=samples), "bfcl_error_summary.txt")
+    # A worklist rather than a dump: what to trust, where the losses are by real cause,
+    # and the specific remedy for each cause this run actually hit.
+    mlflow.log_text(render_diagnosis(by_group, model, source_run_id), "bfcl_diagnosis.md")
+    mlflow.log_text(categories_csv(by_group), "bfcl_categories.csv")
+    mlflow.log_text(failures_csv(by_group), "bfcl_failures.csv")
     # The raw material behind the numbers: result/ is every generation the model
     # produced, score/ is every failed case with its expected answer and checker error.
     if result_dir.is_dir():
@@ -336,7 +364,12 @@ def main() -> None:
         # accuracy metrics already logged shouldn't be thrown away because the extra
         # detail failed to upload.
         try:
-            log_failure_detail(Path(args.bfcl_project_root), args.model, samples=args.failure_samples)
+            log_failure_detail(
+                Path(args.bfcl_project_root),
+                args.model,
+                samples=args.failure_samples,
+                source_run_id=args.model_source_run_id,
+            )
         except Exception as e:
             print(f"WARNING: failed to log BFCL failure detail/artifacts: {e}")
 
