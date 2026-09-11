@@ -184,58 +184,41 @@ section for both, plus the "just serve it, no eval" variant.
 
 ### 5. vLLM latency benchmark
 
-Uses `vllm`'s own built-in `BFCLDataset` loader — real tool-calling traffic (BFCL
-categories translated to OpenAI tool schemas), no custom conversion code.
-`--bfcl-categories` narrows it to the same AST-evaluated, single-turn "python" collection
-`run_bfcl_eval.py`'s `TEST_COLLECTION_MAPPING` uses elsewhere in this repo. One thing
-worth knowing regardless: it sends tools via the native `tools`/`tool_choice` API (the
-"-FC" format), whereas this project's fine-tune uses prompting-style tool calls (tools as
-text in the system message — same distinction `run_bfcl_eval.py` is careful about
-elsewhere in this repo) — realistic tool-calling-*shaped* load, not an exact replica of
-this model's actual production request format. Logs mean/median/p50/p95/p99 TTFT, TPOT,
-inter-token latency, and request/output/total-token throughput to MLflow. Each invocation
-is one run — repeat at 1/8/16/24/32 concurrency for the production comparison (see
-"Confirmed constraints" above), they'll show up as separate, directly comparable rows.
+Three steps: serve the checkpoint, port-forward it, run the benchmark. Repeat step 3 at
+each concurrency level you want (1/8/16/24/32 — see "Confirmed constraints" above); each
+run logs to MLflow as its own row, so they compare directly.
 
-**Option A — one manifest, no port-forwarding** (`configs/templates/inference/
-vllm-bench-mlflow-checkpoint-job.yaml`): bundles the same serve-only Deployment+Service
-as Option B below *and* a Job that runs the benchmark and logs to MLflow, both reaching
-each other over their normal in-cluster Service DNS — nothing to port-forward or leave
-running in a spare terminal.
+**1. Clear out anything already running, then serve the checkpoint on its run_id.** This
+project targets a single GPU — any other leftover `fin-agent-vllm-*` Deployment (a
+previous benchmark, a stale SFT/GRPO/baseline server) competes for it and can leave the
+new pod stuck `Pending`, so check for and clear those too, not just `fin-agent-vllm-sft`:
 
 ```bash
-sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' -e 's/__CONCURRENCY__/32/g' \
-  configs/templates/inference/vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
-kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
-kubectl -n fin-agent wait --for=condition=complete job/fin-agent-vllm-bench-sft --timeout=1800s
-kubectl -n fin-agent logs -l app=fin-agent-vllm-bench-sft --tail=40
-```
-
-Reapply with a different `__CONCURRENCY__` for each point on the sweep — the Job gets
-deleted/reapplied each time, but the vLLM Deployment is left running between reapplies
-(same teardown discipline as step 4's manifest), so only the fast benchmark step repeats,
-not the checkpoint download. Tear everything down, Deployment included, when done:
-`kubectl -n fin-agent delete -f <(sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id>/g'
--e 's/__CONCURRENCY__/32/g' configs/templates/inference/vllm-bench-mlflow-checkpoint-job.yaml)`.
-
-**Option B — serve + bench separately** (useful for iterating on benchmark flags without
-re-rolling the Deployment, or running the bench from a bare host): serve the checkpoint
-with `configs/templates/inference/vllm-serve-checkpoint.yaml` (the same serve-only
-Deployment+Service Option A bundles, no BFCL Job, no results PVC):
-
-```bash
+kubectl -n fin-agent get deployments -l 'app in (fin-agent-vllm-sft,fin-agent-vllm-grpo,fin-agent-vllm-qwen3-8b)'
+kubectl -n fin-agent delete deployment fin-agent-vllm-sft fin-agent-vllm-grpo fin-agent-vllm-qwen3-8b --ignore-not-found --wait=true
+kubectl -n fin-agent delete service fin-agent-vllm-sft fin-agent-vllm-grpo fin-agent-vllm-qwen3-8b --ignore-not-found
 sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
   configs/templates/inference/vllm-serve-checkpoint.yaml | kubectl apply -f -
 kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
+kubectl -n fin-agent get pods -l app=fin-agent-vllm-sft   # confirm one pod, freshly created
+```
+
+**2. Kill any stale local port-forwards, then start fresh ones — each in its own
+terminal, left running.** A `kubectl port-forward` left over from an earlier attempt can
+still be bound to these local ports while pointing at a pod that's gone:
+
+```bash
+pkill -f "port-forward svc/fin-agent-vllm-sft" || true
+pkill -f "port-forward svc/mlflow" || true
 kubectl -n fin-agent port-forward svc/fin-agent-vllm-sft 8000:8000
 ```
 
-Then, in **another terminal** (the port-forward above must stay running the whole time —
-confirm it's actually up with `curl http://localhost:8000/health` before proceeding, a
-dead/never-started port-forward fails every request with a plain connection-refused
-error, not a useful one), `tox -e vllm-bench` — runs `vllm bench serve` and logs to
-MLflow via `2_evaluations/log_vllm_bench_to_mlflow.py` (also needs `kubectl -n fin-agent
-port-forward svc/mlflow 5000:5000` running in its own terminal):
+And, in another terminal: `kubectl -n fin-agent port-forward svc/mlflow 5000:5000`.
+Before step 3, confirm both are actually up — `curl http://localhost:8000/health` — a
+dead port-forward fails every request with a plain connection-refused error, not a useful
+one.
+
+**3. Run the benchmark, in a third terminal:**
 
 ```bash
 tox -e vllm-bench -- \
@@ -248,11 +231,13 @@ tox -e vllm-bench -- \
   --max-concurrency 32
 ```
 
-(Prefer the plain `vllm bench serve` CLI without MLflow logging? Drop the `tox -e
-vllm-bench --` prefix and pass the same flags directly — see
-`log_vllm_bench_to_mlflow.py`'s docstring for the underlying command it builds.) Tear the
-Deployment down when done:
-`kubectl -n fin-agent delete -f configs/templates/inference/vllm-serve-checkpoint.yaml`
-(after re-substituting `__NAME__`/`__RUN_ID__`, or just
+Logs mean/median/p50/p95/p99 TTFT, TPOT, inter-token latency, and request/output/total-
+token throughput to MLflow. Uses `vllm`'s own built-in `BFCLDataset` loader — real
+tool-calling traffic, no custom conversion code — but sends tools via the native
+`tools`/`tool_choice` API, whereas this project's fine-tune uses prompting-style tool
+calls (tools as text in the system message); realistic tool-calling-*shaped* load, not an
+exact replica of this model's production request format.
+
+Tear the Deployment down when done:
 `kubectl -n fin-agent delete deployment fin-agent-vllm-sft && kubectl -n fin-agent delete
-service fin-agent-vllm-sft --ignore-not-found`).
+service fin-agent-vllm-sft --ignore-not-found`.
