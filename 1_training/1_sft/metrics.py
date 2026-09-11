@@ -215,7 +215,46 @@ def aggregate_metrics(scored_examples: list[tuple[str, list[dict[str, Any]]]]) -
     for error_type in ERROR_TYPES:
         metrics[f"error_rate_{error_type}"] = (error_counts.get(error_type, 0) / n) if n else None
 
+    decision_rates = [metrics[key] for key in ("full_call_accuracy", "refusal_accuracy") if metrics[key] is not None]
+    metrics["balanced_call_accuracy"] = sum(decision_rates) / len(decision_rates) if decision_rates else None
+
     return {k: v for k, v in metrics.items() if v is not None}
+
+
+def summarize_error_gaps(conversations: list[dict], parse_prediction) -> dict:
+    """Overlapping diagnostic slices; flags are not semantic root-cause labels.
+
+    Save IDs for inspection, and denominators so tiny slices stay visible. In
+    particular, a prerequisite keyword is a proxy, not proof of premature action.
+    """
+    slices = {}
+    for conversation in conversations:
+        for turn in conversation["turns"]:
+            score = turn["score"]
+            calls = turn["expected_calls"]
+            keys = [conversation["call_type"], "call" if calls is not None else "no_call"]
+            context = turn["context"]
+            if context and (context[-1]["role"] == "tool" or re.search(
+                r"\b(before|after|once|first|then|if)\b", context[-1]["content"], re.I
+            )):
+                keys.append("prerequisite_proxy")
+            if calls and len({c["name"] for c in calls}) < len(calls):
+                keys.append("repeated_tool_calls")
+            predicted = parse_prediction(turn["prediction"]) or []
+            for key in set(keys):
+                row = slices.setdefault(key, {"n": 0, "correct": 0, "truncated": 0,
+                                              "wrong_call_count": 0, "failures": []})
+                row["n"] += 1
+                row["correct"] += int(_instance_correct(score))
+                row["truncated"] += int(turn["reached_token_limit"])
+                row["wrong_call_count"] += int(calls is not None and len(predicted) != len(calls))
+                if not _instance_correct(score):
+                    row["failures"].append({"conversation_id": conversation["conversation_id"],
+                                            "turn_index": turn["turn_index"],
+                                            "error_type": score.get("error_type")})
+    for row in slices.values():
+        row["accuracy"] = row["correct"] / row["n"]
+    return slices
 
 
 def compare_validation_reports(baseline: dict, candidate: dict, n_bootstrap: int = 10000, seed: int = 0) -> dict:

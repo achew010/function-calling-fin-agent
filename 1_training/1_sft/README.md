@@ -126,6 +126,13 @@ the single `eval_fc_call_correctness` scalar `metric_for_best_model` uses — us
 telling *which* kind of error is driving a change in that scalar rather than just that
 one happened.
 
+Generation evaluation uses left-padded batches (`--metrics-batch-size 4` by default),
+with flushed progress lines showing the step, active turn range, total turns, and
+elapsed time. The training bar remains at zero until baseline loss and generation
+evaluation finish. Reduce `--metrics-batch-size` to 1 if GPU memory is tight.
+Padding and model training mode are restored even when generation raises an error.
+Changing generation batch size requires a fresh baseline for paired comparisons.
+
 Each evaluation saves `validation_predictions/step-NNNNNN.json` inside the output
 directory, with conversation IDs, per-turn contexts, expected calls, predictions,
 scores, generated-token counts, token-limit flags, and dataset/scorer/template hashes.

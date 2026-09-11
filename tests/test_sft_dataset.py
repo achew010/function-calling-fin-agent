@@ -7,6 +7,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -278,3 +279,67 @@ def test_callback_full_validation_default_and_fixed_smoke_subset(tmp_path, examp
     assert small.examples == repeated.examples
     with pytest.raises(ValueError, match="nonnegative"):
         train_sft.FunctionCallEvalCallback(path, eval_samples=-1)
+
+
+def test_batched_eval_preserves_order_trims_eos_and_restores_state(tmp_path, tokenizer, example, monkeypatch, capsys):
+    path = write_examples(tmp_path, [example, example])
+    callback = train_sft.FunctionCallEvalCallback(path, batch_size=3)
+    callback.trainer = SimpleNamespace(log=lambda values: None)
+    model = tiny_model(tokenizer)
+    model.train()
+    responses = ["[lookup(account='ABC')]", "[transfer(to='XYZ', amount=5)]"] * 2
+    seen = []
+
+    def generate(input_ids, attention_mask, **kwargs):
+        assert tokenizer.padding_side == "left"
+        assert torch.all(attention_mask[:, -1] == 1)
+        if not seen:
+            assert (attention_mask[:, 0] == 0).any()
+        offset = sum(seen)
+        seen.append(len(input_ids))
+        completions = [tokenizer.encode(text, add_special_tokens=False) + [tokenizer.eos_token_id]
+                       for text in responses[offset:offset + len(input_ids)]]
+        width = max(map(len, completions))
+        # Pad with EOS too, exercising the pad==EOS case used by many models.
+        padded = [ids + [tokenizer.eos_token_id] * (width - len(ids)) for ids in completions]
+        return torch.cat([input_ids, torch.tensor(padded, device=input_ids.device)], dim=1)
+
+    monkeypatch.setattr(model, "generate", generate)
+    callback.on_evaluate(
+        SimpleNamespace(output_dir=str(tmp_path), process_index=0),
+        SimpleNamespace(global_step=0), None, {}, model=model, processing_class=tokenizer,
+    )
+    assert seen == [3, 1]
+    assert model.training
+    assert tokenizer.padding_side == "right"
+    report = json.loads((tmp_path / "validation_predictions" / "step-000000.json").read_text())
+    turns = [turn for conv in report["conversations"] for turn in conv["turns"]]
+    assert [turn["prediction"] for turn in turns] == responses
+    assert [turn["turn_index"] for turn in turns] == [0, 1, 0, 1]
+    for turn, response in zip(turns, responses):
+        assert turn["generated_tokens"] == len(tokenizer.encode(response, add_special_tokens=False)) + 1
+        assert not turn["reached_token_limit"]
+    output = capsys.readouterr().out
+    assert "1-3/4" in output
+    assert "4-4/4" in output
+    assert "generation complete" in output
+
+
+def test_eval_generation_failure_restores_training_and_padding(tmp_path, tokenizer, example, monkeypatch):
+    callback = train_sft.FunctionCallEvalCallback(write_examples(tmp_path, [example]))
+    callback.trainer = SimpleNamespace(log=lambda values: None)
+    model = tiny_model(tokenizer)
+    model.train()
+
+    def fail(**kwargs):
+        raise RuntimeError("generation failed")
+
+    monkeypatch.setattr(model, "generate", fail)
+    with pytest.raises(RuntimeError, match="generation failed"):
+        callback.on_evaluate(
+            SimpleNamespace(output_dir=str(tmp_path), process_index=0),
+            SimpleNamespace(global_step=0), None, {}, model=model, processing_class=tokenizer,
+        )
+    assert model.training
+    assert tokenizer.padding_side == "right"
+    assert not (tmp_path / "validation_predictions").exists()

@@ -6,12 +6,11 @@ signal from a policy that rarely produces a valid completion to begin with).
 
 Reward: mirrors 2_evaluations/run_internal_eval.py's scoring dimensions (function-name
 match, parameter match, hallucination penalty, refusal correctness), collapsed into one
-scalar with partial credit — see compute_reward. This is what "training with BFCL/the
-internal eval in mind" means concretely: the reward function and the eval gate are the
-same logic, so training optimizes directly toward what promotion is gated on, rather
-than token-level match against ToolACE's one reference completion. It's a starting
-design, not a final one — see the README for the risk-tier-weighting extension once
-0_data's risk_tier field carries real values instead of "unclassified".
+scalar with typed argument partial credit and one-to-one matching of repeated calls.
+Exact-call matching reuses the evaluator's canonicalization; the shaped reward is a
+training surrogate, not the checkpoint-selection metric. --reward-mode legacy restores
+the original flat partial credit for a controlled ablation. See the README for limits
+of parser-based refusal scoring and the risk-tier-weighting extension.
 
 Dataset: reuses 2_evaluations/run_internal_eval.py's build_eval_instances (imported, not
 reimplemented) to turn each conversation into one training prompt per assistant turn —
@@ -33,6 +32,10 @@ import json
 import os
 import shutil
 import sys
+import random
+import re
+import hashlib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -55,9 +58,10 @@ from train_sft import FunctionCallEvalCallback  # noqa: E402
 from datasets import Dataset
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
+from scipy.optimize import linear_sum_assignment
 
 
-def build_grpo_dataset(path: Path) -> Dataset:
+def build_grpo_dataset(path: Path, example_ids: list[int] | None = None) -> Dataset:
     """One row per assistant turn (same instances run_internal_eval.py scores), with the
     ground truth needed to compute a reward carried alongside the prompt rather than
     baked into a single target completion.
@@ -69,6 +73,8 @@ def build_grpo_dataset(path: Path) -> Dataset:
     form. reward_func decodes it back with json.loads per-row.
     """
     examples = load_examples(path)
+    if example_ids is not None:
+        examples = [examples[i] for i in example_ids]
     prompts, tool_names_col, is_call_case_col, expected_calls_col = [], [], [], []
     for ex in examples:
         for instance in build_eval_instances(ex):
@@ -86,9 +92,174 @@ def build_grpo_dataset(path: Path) -> Dataset:
     )
 
 
+def context_hash(context: list[dict]) -> str:
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+
+def grounded_arguments(calls: list[dict], context: list[dict]) -> bool:
+    """Conservative pilot filter, not a semantic verifier.
+
+    Every scalar argument must appear in user/tool context. Exclude assistant prose
+    and schemas so invented earlier answers and example/default values don't qualify.
+    This deliberately drops valid examples needing inference or canonicalization.
+    """
+    text = "\n".join(m["content"] for m in context if m["role"] in {"user", "tool"}).casefold()
+    def supported(value):
+        if isinstance(value, dict):
+            return all(supported(v) for v in value.values())
+        if isinstance(value, list):
+            return all(supported(v) for v in value)
+        if type(value) in {int, float}:
+            return any(float(n) == value for n in re.findall(r"(?<!\w)-?\d+(?:\.\d+)?(?!\w)", text))
+        if isinstance(value, str):
+            return bool(value.strip()) and value.casefold() in text
+        return str(value).casefold() in text
+    return all(supported(call.get("arguments", {})) for call in calls)
+
+
+def build_pilot_dataset(train_file: Path, val_file: Path, size: int = 256, seed: int = 42):
+    """Select one target per training conversation, half no-call and half valid-call.
+
+    No-call targets must follow a user and contain an explicit clarification or
+    inability statement in the reference. Call targets require grounded arguments;
+    prerequisite-related cases are prioritized. Exact validation-context overlaps
+    exclude the entire training conversation. No validation predictions guide mining.
+    """
+    if size < 2 or size % 2:
+        raise ValueError("Pilot size must be a positive even number of at least 2")
+    excluded = {context_hash(inst["context"]) for ex in load_examples(val_file)
+                for inst in build_eval_instances(ex)}
+    buckets = {"clarify_or_abstain": [], "prerequisite_call": [], "grounded_call": []}
+    seen = set()
+    for cid, ex in enumerate(load_examples(train_file)):
+        instances = build_eval_instances(ex)
+        if any(context_hash(inst["context"]) in excluded for inst in instances):
+            continue
+        references = [turn["content"] for turn in ex["turns"] if turn["role"] == "assistant"]
+        candidates = []
+        for tid, (inst, reference) in enumerate(zip(instances, references)):
+            context, calls = inst["context"], inst["expected_calls"]
+            if not context:
+                continue
+            if calls is None:
+                if context[-1]["role"] != "user" or not re.search(
+                    r"\b(provide|specify|clarify|missing|required|cannot|can't|unable|not available|need)\b",
+                    reference, re.IGNORECASE,
+                ):
+                    continue
+                bucket = "clarify_or_abstain"
+            elif calls and grounded_arguments(calls, context):
+                prerequisite = context[-1]["role"] == "tool" or re.search(
+                    r"\b(before|after|once|first|then|if)\b", context[-1]["content"], re.IGNORECASE)
+                bucket = "prerequisite_call" if prerequisite else "grounded_call"
+            else:
+                continue
+            candidates.append((bucket, tid, inst, reference))
+        # Prefer clarification targets, then prerequisite calls; at most one per conversation.
+        candidates.sort(key=lambda item: list(buckets).index(item[0]))
+        for bucket, tid, inst, reference in candidates:
+            fingerprint = context_hash(inst["context"])
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            buckets[bucket].append({
+                "prompt": inst["context"], "tool_names": sorted(inst["tool_names"]),
+                "is_call_case": inst["expected_calls"] is not None,
+                "expected_calls": json.dumps(inst["expected_calls"] or []),
+                "source_conversation_id": cid, "source_turn_index": tid,
+                "pilot_bucket": bucket, "reference": reference,
+            })
+            break
+    rng = random.Random(seed)
+    for values in buckets.values():
+        rng.shuffle(values)
+    half = size // 2
+    calls = buckets["prerequisite_call"] + buckets["grounded_call"]
+    if len(buckets["clarify_or_abstain"]) < half or len(calls) < half:
+        raise ValueError(f"Not enough eligible pilot examples for {size}: "
+                         f"{ {key: len(value) for key, value in buckets.items()} }")
+    # Reserve half the call examples for ordinary valid calls, with backfill if
+    # either pool is small. Prerequisite cases must not crowd out the guard set.
+    quota = half // 2
+    chosen_calls = buckets["prerequisite_call"][:quota] + buckets["grounded_call"][:half - quota]
+    chosen_ids = {row["source_conversation_id"] for row in chosen_calls}
+    chosen_calls += [row for row in calls if row["source_conversation_id"] not in chosen_ids][:half - len(chosen_calls)]
+    selected = buckets["clarify_or_abstain"][:half] + chosen_calls
+    rng.shuffle(selected)
+    manifest = {"seed": seed, "n_targets": len(selected),
+                "eligible_counts": {key: len(value) for key, value in buckets.items()},
+                "selected_counts": dict(Counter(row["pilot_bucket"] for row in selected)),
+                "train_sha256": hashlib.sha256(train_file.read_bytes()).hexdigest(),
+                "val_sha256": hashlib.sha256(val_file.read_bytes()).hexdigest(),
+                "examples": selected}
+    columns = ("prompt", "tool_names", "is_call_case", "expected_calls")
+    return Dataset.from_list([{key: row[key] for key in columns} for row in selected]), manifest
+
+
+def select_probe_ids(val_file: Path, size: int = 128, seed: int = 42) -> list[int]:
+    """Round-robin stratification by conversation call_type; never by model errors."""
+    if size < 1:
+        raise ValueError("Probe size must be positive")
+    buckets = {}
+    for cid, ex in enumerate(load_examples(val_file)):
+        buckets.setdefault(ex["call_type"], []).append(cid)
+    rng = random.Random(seed)
+    for rows in buckets.values():
+        rng.shuffle(rows)
+    chosen = []
+    while len(chosen) < size and any(buckets.values()):
+        for key in sorted(buckets):
+            if buckets[key] and len(chosen) < size:
+                chosen.append(buckets[key].pop())
+    return sorted(chosen)
+
+
+def apply_pilot_defaults(args, argv):
+    """Explicit CLI overrides win over the pilot preset."""
+    if not args.pilot:
+        return
+    defaults = {"max_steps": 100, "num_generations": 4, "grad_accum": 4,
+                "eval_steps": 25, "save_steps": 25, "logging_steps": 5,
+                "max_completion_length": 512, "metrics_max_new_tokens": 512}
+    for key, value in defaults.items():
+        flag = "--" + key.replace("_", "-")
+        if not any(arg == flag or arg.startswith(flag + "=") for arg in argv):
+            setattr(args, key, value)
+
+
+def typed_equal(left: Any, right: Any) -> bool:
+    """Exact recursive equality: booleans, integers and floats are distinct."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(typed_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(typed_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def argument_credit(predicted: dict, expected: dict) -> float:
+    """Union of keys penalizes both omitted and invented arguments.
+
+    A present argument earns 1/4 for its top-level type and 3/4 for exact typed value.
+    """
+    keys = predicted.keys() | expected.keys()
+    if not keys:
+        return 1.0
+    return sum(
+        0.25 * (type(predicted[k]) is type(expected[k])) + 0.75 * typed_equal(predicted[k], expected[k])
+        for k in keys if k in predicted and k in expected
+    ) / len(keys)
+
+
 def compute_reward(
-    text: str, tool_names: list[str], is_call_case: bool, expected_calls: list[dict[str, Any]]
+    text: str, tool_names: list[str], is_call_case: bool, expected_calls: list[dict[str, Any]],
+    reward_mode: str = "dense",
 ) -> float:
+    if reward_mode not in {"dense", "legacy"}:
+        raise ValueError(f"Unknown reward mode: {reward_mode}")
+    if reward_mode == "dense" and not text.strip():
+        return -1.0  # an empty generation is not a successful refusal
     predicted = parse_prediction(text)
     if not is_call_case:
         return 1.0 if predicted is None else -1.0  # correct refusal vs. an unwarranted call
@@ -98,7 +269,23 @@ def compute_reward(
         return -2.0  # hallucinated a call — worst case, matches the risk-tiering framing
     if {c["name"] for c in predicted} != {c["name"] for c in expected_calls}:
         return -0.5  # wrong function entirely
-    return 1.0 if normalize_calls(predicted) == normalize_calls(expected_calls) else 0.3  # right fn, wrong args
+    if reward_mode == "legacy":
+        return 1.0 if normalize_calls(predicted) == normalize_calls(expected_calls) else 0.3
+    if Counter(c["name"] for c in predicted) != Counter(c["name"] for c in expected_calls):
+        return -0.5  # missing/extra invocations, including duplicates of a known tool
+    if normalize_calls(predicted) == normalize_calls(expected_calls):
+        return 1.0  # preserve a distinct exact-call bonus
+
+    total_credit = 0.0
+    for name in sorted({c["name"] for c in expected_calls}):
+        actual = [c.get("arguments", {}) for c in predicted if c["name"] == name]
+        target = [c.get("arguments", {}) for c in expected_calls if c["name"] == name]
+        credits = [[argument_credit(p, e) for e in target] for p in actual]
+        # One-to-one maximum-weight matching: a good prediction cannot earn credit
+        # for several expected invocations of the same tool.
+        rows, columns = linear_sum_assignment(credits, maximize=True)
+        total_credit += sum(credits[i][j] for i, j in zip(rows, columns))
+    return 0.1 + 0.7 * total_credit / len(expected_calls)
 
 
 def reward_func(
@@ -106,6 +293,7 @@ def reward_func(
     tool_names: list[list[str]],
     is_call_case: list[bool],
     expected_calls: list[str],
+    reward_mode: str = "dense",
     **kwargs: Any,
 ) -> list[float]:
     """GRPOTrainer's reward-function contract: `completions` is one message per
@@ -113,9 +301,11 @@ def reward_func(
     through as a same-length list, aligned to `completions` (verified against the
     installed trl version's GRPOTrainer/trl.rewards source — not assumed). `expected_calls`
     arrives JSON-encoded (see build_grpo_dataset) and is decoded here."""
-    texts = [c[0]["content"] for c in completions]
+    if len({len(completions), len(tool_names), len(is_call_case), len(expected_calls)}) != 1:
+        raise ValueError("Reward inputs must have matching lengths")
+    texts = [c[0].get("content") or "" for c in completions]
     return [
-        compute_reward(text, names, is_case, json.loads(calls_json))
+        compute_reward(text, names, is_case, json.loads(calls_json), reward_mode=reward_mode)
         for text, names, is_case, calls_json in zip(texts, tool_names, is_call_case, expected_calls)
     ]
 
@@ -138,6 +328,10 @@ def main() -> None:
         "correctness, and no 'best' checkpoint to restore if it did.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--pilot", action="store_true", help="Targeted 100-update run with balanced training targets and a stratified validation probe.")
+    parser.add_argument("--pilot-train-samples", type=int, default=256)
+    parser.add_argument("--pilot-eval-samples", type=int, default=128)
+    parser.add_argument("--pilot-seed", type=int, default=42)
     parser.add_argument("--num-generations", type=int, default=8, help="Group size G — completions sampled per prompt.")
     parser.add_argument(
         "--num-generations-eval",
@@ -154,6 +348,8 @@ def main() -> None:
     )
     parser.add_argument("--max-completion-length", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--reward-mode", choices=["dense", "legacy"], default="dense",
+                        help="Dense typed argument credit (default), or the original flat 0.3 partial reward for ablations.")
     parser.add_argument(
         "--kl-beta",
         type=float,
@@ -188,8 +384,8 @@ def main() -> None:
         default=2,
         help="Paired with --per-device-batch-size above to keep "
         "per_device_batch_size * --grad-accum a multiple of --num-generations. Also "
-        "sets steps_per_generation (TRL defaults it to gradient_accumulation_steps), "
-        "i.e. how many optimizer steps reuse one batch of rollouts.",
+        "sets the default steps_per_generation, measured in forward/backward "
+        "microsteps, not optimizer updates.",
     )
     parser.add_argument(
         "--eval-batch-size",
@@ -227,6 +423,7 @@ def main() -> None:
         help="Validation conversations for generation metrics: 0 uses the full split; positive values select a fixed smoke-test subset.",
     )
     parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
+    parser.add_argument("--metrics-batch-size", type=int, default=4)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument(
@@ -235,13 +432,25 @@ def main() -> None:
     parser.add_argument("--mlflow-experiment-name", default=None)
     parser.add_argument("--mlflow-tracking-uri", default=None, help="Defaults to local ./mlruns if unset.")
     args = parser.parse_args()
+    apply_pilot_defaults(args, sys.argv[1:])
 
-    train_dataset = build_grpo_dataset(args.train_file)
+    probe_ids = None
+    if args.pilot:
+        train_dataset, selection = build_pilot_dataset(
+            args.train_file, args.val_file, size=args.pilot_train_samples, seed=args.pilot_seed)
+        probe_ids = select_probe_ids(args.val_file, args.pilot_eval_samples, args.pilot_seed)
+        selection["validation_conversation_ids"] = probe_ids
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "pilot_selection.json").write_text(json.dumps(selection, indent=2))
+        print(f"GRPO pilot: {selection['selected_counts']}; {len(probe_ids)} validation conversations; "
+              f"{args.max_steps} updates", flush=True)
+    else:
+        train_dataset = build_grpo_dataset(args.train_file)
     # Also gives GRPOTrainer's own built-in eval loop (reward/kl/entropy/completion-
     # length, computed the same way as training rollouts) on real held-out data for
     # free, on top of FunctionCallEvalCallback's richer metrics.py breakdown below --
     # both need a non-None eval_dataset to fire at all (Trainer raises otherwise).
-    eval_dataset = build_grpo_dataset(args.val_file)
+    eval_dataset = build_grpo_dataset(args.val_file, example_ids=probe_ids)
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -279,7 +488,7 @@ def main() -> None:
         # this is the actual fix for GRPO previously having no protection against a
         # reward-optimized policy drifting away from real correctness over the run.
         load_best_model_at_end=True,
-        metric_for_best_model="fc_call_correctness",
+        metric_for_best_model="balanced_call_accuracy" if args.pilot else "fc_call_correctness",
         greater_is_better=True,
         report_to=[],
     )
@@ -289,11 +498,20 @@ def main() -> None:
         eval_samples=args.metrics_eval_samples,
         max_new_tokens=args.metrics_max_new_tokens,
         log_artifacts=args.mlflow,
+        batch_size=args.metrics_batch_size,
+        example_ids=probe_ids,
     )
 
+    def grpo_reward(completions, **kwargs):
+        return reward_func(completions, reward_mode=args.reward_mode, **kwargs)
+
+    print(f"GRPO reward={args.reward_mode}, generations={args.num_generations}, "
+          f"generation_batch_size={grpo_config.generation_batch_size}, "
+          f"unique_prompts_per_generation_batch={grpo_config.generation_batch_size // args.num_generations}",
+          flush=True)
     trainer = GRPOTrainer(
         model=args.base_model,
-        reward_funcs=reward_func,
+        reward_funcs=grpo_reward,
         args=grpo_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -336,6 +554,10 @@ def main() -> None:
                 "lora_alpha": args.lora_alpha,
                 "kl_beta": args.kl_beta,
                 "num_generations": args.num_generations,
+                "reward_mode": args.reward_mode,
+                "pilot": args.pilot,
+                "train_targets": len(train_dataset),
+                "validation_targets": len(eval_dataset),
             }
         )
 

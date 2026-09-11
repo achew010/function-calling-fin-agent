@@ -38,13 +38,40 @@ dimensions, collapsed into one scalar with partial credit:
 
 | Case | Reward |
 |---|---|
-| Correct refusal (no call expected, none made) | `+1.0` |
+| Nonempty response with no parsed call when no call is expected | `+1.0` (heuristic; see below) |
+| Empty/whitespace-only response | `-1.0` |
 | Unwarranted call (no call expected, one made) | `-1.0` |
 | Missed call (call expected, none made) | `-1.0` |
 | Hallucinated call (function not in the tool list) | `-2.0` — worst case |
-| Wrong function entirely | `-0.5` |
-| Right function, wrong arguments | `+0.3` |
+| Wrong function or incorrect number of invocations | `-0.5` |
+| Right functions and counts, imperfect arguments | `0.1 + 0.7 × argument credit`, at most `0.8` |
 | Right function, right arguments | `+1.0` |
+
+The default `--reward-mode dense` grades arguments rather than giving all imperfect
+calls the same reward. Each argument earns 0.25 for the correct top-level type and
+0.75 for an exact typed value; nested type differences also invalidate exact value
+credit. Divide by the union of expected/predicted keys, so missing and extra arguments
+both reduce credit. Average across calls after maximum-weight one-to-one matching
+within each function name. Repeated calls cannot double-count a good prediction.
+Completely correct calls retain a separate 1.0 reward.
+
+Use `--reward-mode legacy` for the original flat 0.3 partial reward and original
+refusal behavior. Keep the SFT starting checkpoint, data, LR, temperature, group size,
+and KL setting fixed for this ablation. Compare generated validation correctness and
+its paired intervals; mean reward is not directly comparable between reward modes.
+
+This does not make refusal scoring semantic: nonempty nonsense that parses as no call
+can still receive positive reward on a no-call example, and the shared parser is
+permissive. The blank-response loophole is closed in dense mode, but parser validity
+and response-quality checks remain separate work before relying on this reward for
+production refusal behavior.
+
+Monitor TRL's `frac_reward_zero_std`, `reward_std`, completion lengths, and full-call
+validation accuracy. Dense rewards may reduce ties but cannot guarantee useful
+within-group variation. Startup prints `unique_prompts_per_generation_batch`; current
+single-GPU defaults (batch 4, accumulation 2, G=8) give one unique prompt. A later
+`--grad-accum 8` experiment gives four prompts per generation batch, with higher rollout
+memory demand and fewer optimizer updates per epoch. It is not enabled by default.
 
 This is a **starting design, not a final one** — the natural extension, once
 `0_data/prepare_dataset.py`'s `risk_tier` field carries real values instead of
@@ -97,7 +124,7 @@ to be too expensive for a given val split size.
   requirement as everywhere else in this project, so rollouts during training match how
   the model is actually served.
 
-Verified without a GPU: `build_grpo_dataset` runs end-to-end against the real
+Historical legacy-reward verification without a GPU: `build_grpo_dataset` runs end-to-end against the real
 `0_data/data/*.jsonl` splits, and `compute_reward`/`reward_func` were self-consistency
 checked the same way `0_data/README.md` checked the call-syntax parser — feeding a
 "perfect" prediction (the exact ground-truth call, or a plausible refusal) back through
@@ -108,7 +135,57 @@ this script passes. Not verified here: an actual training run — that needs a G
 `Qwen/Qwen3-8B` (or the SFT checkpoint) and run rollout generation, which this
 environment doesn't have.
 
+Current CPU tests (`tox -e sft-tests`) cover graded rewards, strict nested types,
+missing/extra arguments, repeated-call matching, blank responses, reward input
+alignment, and GRPO dataset construction. A tiny random Qwen model exercises one real
+GRPO update plus baseline/checkpoint evaluation and merged-model saving. This checks
+the training integration, not quality or GPU memory usage of the 8B model.
+
 ## Run
+
+### Targeted SFT-error pilot (default Kubernetes job)
+
+Add `--pilot` to the command below. This starts from the **post-SFT checkpoint**,
+caps training at **100 optimizer updates**, uses four generations per prompt and
+batch 4 × accumulation 4 (four unique prompts per update on one GPU). Evaluation
+and saving run at steps 25/50/75/100, with a step-0 SFT baseline evaluation.
+Explicit CLI flags override the preset. Completion and greedy-evaluation limits
+remain 512 tokens: nine selected references in the local prepared data exceed 256.
+
+The focus is the observed SFT errors, not token accuracy:
+
+- **Unwarranted calls / missing information:** 128 clarification or inability
+  targets, selected from training references after user turns.
+- **Prerequisite handling and argument grounding:** 64 prerequisite-related call
+  targets. All scalar reference arguments must occur in user/tool context.
+- **Over-refusal guard:** 64 ordinary grounded call targets; valid calls still need
+  to succeed. Call buckets backfill each other if one has too few candidates.
+
+Selection is seeded, uses at most one target per training conversation, and excludes
+exact validation-context overlaps. `pilot_selection.json` records source IDs, contexts,
+references, bucket counts and data hashes. These lexical filters are **proxies**, not
+proof of correct labels or confirmed SFT mistakes on those training examples. Review
+the manifest for unsupported references. No BFCL or validation failures become
+training examples, and the test split stays untouched.
+
+The fixed 128-conversation validation probe is stratified by `call_type` (locally,
+32 each of single/parallel/no-call/multi-turn). Both evaluation paths use these same
+conversation IDs. Saved prediction reports include error slices with denominators,
+failed conversation/turn IDs, truncation counts and wrong-call-count counts, including
+repeated-tool and prerequisite-keyword slices. Prerequisite slices are not semantic
+labels for premature action; inspect the saved predictions to establish that cause.
+
+Checkpoint selection uses the mean of exact-call accuracy and no-call accuracy,
+not token accuracy or training reward. Inspect **both** rates against step 0: a mean
+gain can still hide over-refusal. Reports retain paired conversation-bootstrap
+comparisons. The probe is development feedback, not a full-validation improvement
+claim; evaluate any promising checkpoint and the SFT baseline on all validation
+conversations before final comparison. No quality gain is guaranteed by this pilot.
+
+Known reward limitation: a nonempty unparsed response can receive no-call credit
+without actually asking a useful clarification question. Argument credit measures
+reference agreement, not independent factual grounding. Thus manually inspecting
+fixed failures remains necessary even if aggregate reward improves.
 
 ```bash
 python train_grpo.py \

@@ -77,6 +77,7 @@ spec:
               cp /src/* /workspace/
               mkdir -p /checkpoints/grpo
               tox -e grpo -- train_grpo.py \
+                --pilot \
                 --base-model /checkpoints/sft \
                 --train-file /data/prepared/train.jsonl \
                 --val-file /data/prepared/val.jsonl \

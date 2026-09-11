@@ -37,6 +37,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-from metrics import aggregate_metrics, compare_validation_reports, score_detailed
+from metrics import aggregate_metrics, compare_validation_reports, score_detailed, summarize_error_gaps
 
 CALL_TYPES = ["single", "parallel", "multi_turn", "no_call"]
 
@@ -164,10 +165,13 @@ class FunctionCallEvalCallback(TrainerCallback):
 
     def __init__(
         self, val_file: Path, eval_samples: int = 0, max_new_tokens: int = 256, seed: int = 0,
-        log_artifacts: bool = False,
+        log_artifacts: bool = False, batch_size: int = 4, example_ids: list[int] | None = None,
     ) -> None:
         if eval_samples < 0:
             raise ValueError("eval_samples must be nonnegative (0 means full validation)")
+        if batch_size < 1:
+            raise ValueError("Generation batch_size must be positive")
+        self.batch_size = batch_size
         examples = load_examples(val_file)
         if not examples:
             raise ValueError("Validation dataset is empty")
@@ -179,36 +183,58 @@ class FunctionCallEvalCallback(TrainerCallback):
         rng = random.Random(seed)
         indexed = list(enumerate(examples))
         self.examples = rng.sample(indexed, min(eval_samples, len(indexed))) if eval_samples else indexed
+        if example_ids is not None:
+            if not example_ids or len(set(example_ids)) != len(example_ids) or any(i < 0 or i >= len(indexed) for i in example_ids):
+                raise ValueError("Validation example_ids must be nonempty, unique, and in range")
+            self.examples = [indexed[i] for i in example_ids]
         self.max_new_tokens = max_new_tokens
         self.log_artifacts = log_artifacts
         self.baseline_report = None
         self.trainer: Any = None  # set by main() after Trainer construction
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if args.eval_on_start and args.process_index == 0:
+            print("[validation] Starting step-zero loss evaluation; full generation evaluation follows "
+                  "before the first training update.", flush=True)
 
     def on_evaluate(self, args, state, control, metrics, model=None, processing_class=None, **kwargs):
         if model is None or processing_class is None or self.trainer is None:
             return
         tokenizer = processing_class
         was_training = model.training
-        model.eval()
+        padding_side = tokenizer.padding_side
         scored_examples: list[tuple[str, list[dict[str, Any]]]] = []
-        conversations = []
-        with torch.no_grad():
-            for conversation_id, ex in self.examples:
-                results = []
-                turns = []
-                for turn_index, instance in enumerate(build_eval_instances(ex)):
-                    prompt = tokenizer.apply_chat_template(
-                        instance["context"],
-                        tokenize=False,
-                        add_generation_prompt=True,
+        conversations = [{"conversation_id": cid, "call_type": ex["call_type"], "turns": []}
+                         for cid, ex in self.examples]
+        pending = [(i, turn_index, instance)
+                   for i, (_, ex) in enumerate(self.examples)
+                   for turn_index, instance in enumerate(build_eval_instances(ex))]
+        started = time.monotonic()
+        eos_ids = model.generation_config.eos_token_id
+        if eos_ids is None:
+            eos_ids = tokenizer.eos_token_id
+        eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])
+        try:
+            model.eval()
+            tokenizer.padding_side = "left"  # decoder-only batched generation
+            with torch.no_grad():
+                for offset in range(0, len(pending), self.batch_size):
+                    batch = pending[offset: offset + self.batch_size]
+                    if args.process_index == 0:
+                        print(f"[validation step={state.global_step}] generating turns "
+                              f"{offset + 1}-{offset + len(batch)}/{len(pending)} "
+                              f"(elapsed {time.monotonic() - started:.1f}s)", flush=True)
+                    prompts = [tokenizer.apply_chat_template(
+                        instance["context"], tokenize=False, add_generation_prompt=True,
                         enable_thinking=False,
-                    )
-                    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                    ) for _, _, instance in batch]
+                    inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(model.device)
                     output_ids = model.generate(
                         **inputs,
                         max_new_tokens=self.max_new_tokens,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=eos_ids or None,
                         # gradient_checkpointing=True (see SFTConfig below) makes
                         # transformers force model.config.use_cache=False for training,
                         # and nothing re-enables it for eval -- without this override,
@@ -219,34 +245,50 @@ class FunctionCallEvalCallback(TrainerCallback):
                         # before model.train() resumes.
                         use_cache=True,
                     )
-                    completion_ids = output_ids[0][inputs["input_ids"].shape[1] :]
-                    completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-                    score = score_detailed(instance, completion_text, parse_prediction, normalize_calls)
-                    results.append(score)
-                    turns.append({
-                        "turn_index": turn_index, "context": instance["context"],
-                        "expected_calls": instance["expected_calls"],
-                        "tool_names": sorted(instance["tool_names"]),
-                        "prediction": completion_text, "score": score,
-                        "generated_tokens": len(completion_ids),
-                        "reached_token_limit": len(completion_ids) >= self.max_new_tokens,
-                    })
-                scored_examples.append((ex["call_type"], results))
-                conversations.append({"conversation_id": conversation_id,
-                                      "call_type": ex["call_type"], "turns": turns})
-        if was_training:
-            model.train()
+                    for row, (i, turn_index, instance) in zip(output_ids, batch):
+                        completion_ids = row[inputs["input_ids"].shape[1]:].tolist()
+                        # Finished sequences are padded to the longest completion in
+                        # the batch. Count only through their first stopping token.
+                        stop = next((j for j, token in enumerate(completion_ids) if token in eos_ids), None)
+                        if stop is not None:
+                            completion_ids = completion_ids[:stop + 1]
+                        completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+                        score = score_detailed(instance, completion_text, parse_prediction, normalize_calls)
+                        conversations[i]["turns"].append({
+                            "turn_index": turn_index, "context": instance["context"],
+                            "expected_calls": instance["expected_calls"],
+                            "tool_names": sorted(instance["tool_names"]),
+                            "prediction": completion_text, "score": score,
+                            "generated_tokens": len(completion_ids),
+                            "reached_token_limit": stop is None and len(completion_ids) >= self.max_new_tokens,
+                        })
+        finally:
+            tokenizer.padding_side = padding_side
+            model.train(was_training)
+        for conversation in conversations:
+            scored_examples.append((conversation["call_type"], [t["score"] for t in conversation["turns"]]))
+        if args.process_index == 0:
+            print(f"[validation step={state.global_step}] generation complete: {len(pending)} turns "
+                  f"in {time.monotonic() - started:.1f}s; scoring and saving report.", flush=True)
 
         detailed = aggregate_metrics(scored_examples)
+        error_gaps = summarize_error_gaps(conversations, parse_prediction)
+        for name, values in error_gaps.items():
+            detailed[f"gap_{name}_accuracy"] = values["accuracy"]
+            detailed[f"gap_{name}_n"] = values["n"]
+            detailed[f"gap_{name}_truncated"] = values["truncated"]
+            detailed[f"gap_{name}_wrong_call_count"] = values["wrong_call_count"]
+        metrics.update({f"eval_{key}": value for key, value in detailed.items()})
         report = {
             "schema_version": 1, "dataset_sha256": self.dataset_sha256,
             "scorer_sha256": self.scorer_sha256,
             "step": state.global_step,
             "generation": {"do_sample": False, "max_new_tokens": self.max_new_tokens,
+                           "batch_size": self.batch_size, "eos_token_ids": eos_ids,
                            "enable_thinking": False,
                            "chat_template_sha256": hashlib.sha256(
                                json.dumps(tokenizer.chat_template, sort_keys=True).encode()).hexdigest()},
-            "metrics": detailed, "conversations": conversations,
+            "metrics": detailed, "conversations": conversations, "error_gaps": error_gaps,
         }
         if state.global_step == 0:
             self.baseline_report = report
@@ -411,6 +453,8 @@ def main() -> None:
         help="Validation conversations for generation metrics: 0 uses the full split (default); a positive number selects a fixed subset for smoke tests.",
     )
     parser.add_argument("--metrics-max-new-tokens", type=int, default=256)
+    parser.add_argument("--metrics-batch-size", type=int, default=4,
+                        help="Batch size for generation-based validation; reduce to 1 if GPU memory is tight.")
     parser.add_argument(
         "--mlflow", action="store_true", help="Log metrics to MLflow via transformers' built-in MLflowCallback."
     )
@@ -500,6 +544,7 @@ def main() -> None:
         eval_samples=args.metrics_eval_samples,
         max_new_tokens=args.metrics_max_new_tokens,
         log_artifacts=args.mlflow,
+        batch_size=args.metrics_batch_size,
     )
 
     trainer = SFTTrainer(
