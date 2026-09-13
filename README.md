@@ -4,6 +4,159 @@ Fine-tunes `Qwen/Qwen3-8B` for function-calling (SFT then GRPO on ToolACE), eval
 against BFCL and an internal risk-tiered suite, and serves it via vLLM — sized against a
 fintech-style production budget of one H100 at 32 concurrent requests.
 
+## What this is
+
+A small open model, taught to be a reliable, cheap tool-calling agent, run against a
+production-shaped budget end to end: **prepare data → SFT → GRPO → evaluate against BFCL
+→ quantize → serve at 32 concurrent requests on one H100**, with every stage's checkpoint,
+config, and metric logged to MLflow so a number in this document is always one `run_id`
+away from the run that produced it. The two sections below walk through what actually
+happened at each stage, with the real numbers.
+
+**Pipeline, at a glance** (full diagram, MLflow read/write contract, and orchestration
+rationale further down in [Pipeline architecture](#pipeline-architecture)):
+
+1. **Dataset prep** — ToolACE conversations mapped to this project's own tool schema.
+2. **SFT** — LoRA fine-tune on the prepared conversations. ✅ succeeded — see below.
+3. **GRPO** — RL fine-tune on top of the SFT checkpoint, rewarding exactly the error
+   modes SFT's own eval surfaced. ⚠️ pilot run produced ~no learning signal — see below.
+4. **BFCL evaluation** — baseline vs. SFT vs. SFT+FP8, against the public leaderboard.
+5. **Serving** — vLLM, FP8-quantized, sized for 32 concurrent requests on one H100.
+
+## Results
+
+### 1. SFT: a successful training run, and why `eval_fc_call_correctness` is the BFCL proxy
+
+BFCL requires standing up a full vLLM server and running the whole suite — too slow to
+check during training. `train_sft.py` runs a smaller eval every 140 steps instead
+(`FunctionCallEvalCallback` in [1_training/1_sft/train_sft.py](1_training/1_sft/train_sft.py)):
+real `model.generate()` (not teacher-forced) on a held-out sample, scored by
+[`call_correctness()`](1_training/1_sft/metrics.py) — the fraction of call-case turns
+whose generated call (function name **and** arguments) exactly matches the expected call.
+
+Why it stands in for BFCL: same success criterion (exact call match from real generation,
+not teacher-forced accuracy) as BFCL's own AST-match scoring — just computed on this
+project's own eval set instead of the public one.
+
+![SFT eval_fc_call_correctness rising from 0.574 to 0.675 over training](docs/assets/sft_eval_fc_call_correctness.png)
+
+The run (`thundering-worm-655`, [MLflow](http://localhost:5000/#/experiments/5/runs/ba61b7db97b24406b608ffa8ee2deae6/model-metrics)):
+
+| Metric | Start (step 0) | End (step 738, 1 epoch) |
+|---|---|---|
+| `eval_fc_call_correctness` | 0.574 | **0.675** (+10.0 pts) |
+| `eval_loss` | 0.86 | 0.238 |
+| `eval_mean_token_accuracy` | 0.72 | 0.929 |
+| `eval_hallucination_rate` | 0.0 | 0.0 (transient 1.6% spike at step 140, gone by 280) |
+| `eval_tool_selection_exact_match` | — | 0.946 |
+| `eval_param_value_accuracy` | — | 0.859 |
+| `eval_refusal_accuracy` | — | 0.895 |
+| `eval_trajectory_accuracy` (full multi-turn exact match) | — | 0.375 |
+
+Training moved `full_call_accuracy` by **+10.0 pts** (95% CI [6.3, 13.9]) and
+`refusal_accuracy` by **+24.8 pts** (95% CI [18.4, 31.8]) against its own step-0 eval,
+logged directly as `eval_vs_baseline_*_delta`, not eyeballed off the chart.
+`eval_trajectory_accuracy` (0.375) requires *every* turn in a multi-turn conversation
+correct — expected to sit well below the 0.946 single-call rate, not a red flag on its own.
+
+**Error breakdown, final checkpoint** (rate per call case, `n`=498):
+
+| Error type | Rate |
+|---|---|
+| Wrong argument value | **11.2%** |
+| Wrong tool selected | 3.1% |
+| Unwarranted call (should have refused) | 2.5% |
+| Extra parameter | 1.5% |
+| Missing parameter | 1.4% |
+| Wrong parameter type | 2.2% |
+| Missed a required call | 1.1% |
+| Hallucinated a nonexistent tool | 0.0% |
+
+Wrong argument *values* dominate by a wide margin — tool selection is close to solved
+(96.9% correct) but getting the right value into a correctly-chosen call is the remaining
+gap. That's the failure surface GRPO targets next.
+
+### 2. GRPO: the attempt, and what the numbers say didn't work
+
+Warm-started from the SFT checkpoint (`sedate-sheep-553`, a 256-prompt/100-step pilot,
+[MLflow](http://localhost:5000/#/experiments/6/runs/94a862f8abc34fb1bd19d78572855292)).
+`compute_reward` in [train_grpo.py](1_training/2_grpo/train_grpo.py) cascades by
+severity — hallucinated call worst, then wrong function, then missing/extra invocations,
+then partial credit for argument correctness — covering the same failure surface as the
+SFT error breakdown above.
+
+![GRPO eval_fc_call_correctness flat at every checkpoint, alongside persistently high frac_reward_zero_std](docs/assets/grpo_flat_signal.png)
+
+It didn't move anything: `eval_fc_call_correctness` was **0.6591 at every one of five
+eval checkpoints** (steps 0, 25, 50, 75, 100) — bit-for-bit identical. The cause shows up
+in `frac_reward_zero_std`, averaging **~70%** over the run (range 50–85%): GRPO's
+advantage is the reward normalized *within* each group of `num_generations` (4)
+completions per prompt, so a group where every sample scores the same contributes zero
+gradient. At ~70%, most steps had little to learn from.
+
+Unused in this run: `--select-by-rollout` filters training prompts down to ones where
+sampled rollouts actually disagree, and `--stall-check-step` halts a run early once no
+eval metric has moved. This was also a pilot (`pilot=True`, logged), not the full
+`grpo-job.yaml` config.
+
+### 3. BFCL: SFT checkpoint vs. baseline vs. the public leaderboard
+
+Full `python`-category BFCL (3,491 cases):
+
+| | Baseline | SFT | SFT + FP8 | Leaderboard ref. |
+|---|---|---|---|---|
+| `bfcl_non_live_ast_accuracy` | 0.902 | **0.917** (+1.5) | 0.917 | 0.886 |
+| `bfcl_live_ast_accuracy` | 0.720 | **0.790** (+7.0) | 0.784 | 0.801 |
+| `bfcl_overall_accuracy` | 0.785 | **0.835** (+5.0) | 0.831 | — |
+
+([baseline](http://localhost:5000/#/experiments/7/runs/b8f2e219f2f0463b9d62f0d0a56c6567) ·
+[SFT](http://localhost:5000/#/experiments/8/runs/b5a846123ee6431b850555b851d31e6c) ·
+[SFT+FP8](http://localhost:5000/#/experiments/11/runs/44efe2b96bb74385a0e4dd0620e174af))
+
+SFT clears the leaderboard reference on Non-Live and closes nearly all the gap on Live
+(0.790 vs. 0.801, within this suite's ±1.7-pt noise band at this sample size). FP8 costs
+**−0.4 pts overall — inside the noise band**. `bfcl_live_relevance_accuracy` (an 18-case
+slice) dropped from 1.0 at baseline to 0.722 after SFT.
+
+### 4. Serving: FP8 quantization and concurrency
+
+![Request throughput and TPOT vs. concurrency, bf16 baseline vs. FP8](docs/assets/fp8_vs_baseline_concurrency.png)
+
+`tox -e vllm-bench` sweep, same checkpoint, bf16 vs. FP8
+([bf16](http://localhost:5000/#/experiments/9/runs/2bd5b009d1f041e0b9980b7f2b105f6a) ·
+[FP8](http://localhost:5000/#/experiments/9/runs/94c48a84f5194f2fa5ce2f8248f0ac57)):
+
+| Concurrency | req/s bf16 | req/s FP8 | TTFT ms bf16 | TTFT ms FP8 | TPOT ms bf16 | TPOT ms FP8 |
+|---|---|---|---|---|---|---|
+| 16 | 30.4 | 43.5 (+43%) | 29.3 | 25.3 | 7.41 | 5.21 |
+| 32 | 45.9 | 65.5 (+43%) | 45.8 | 47.7 | 7.64 | 5.57 |
+| 64 | 61.9 | 83.4 (+35%) | 109.0 | 95.1 | 8.19 | 6.20 |
+
+**Concurrency target.** Confirmed constraint: 32 concurrent requests — the benchmark's
+`--concurrencies 32` row. Measured `request_throughput` there: 45.9 req/s (bf16), 65.5
+req/s (FP8).
+
+**Three metrics:**
+- **TTFT** — prefill time: one pass over the input prompt, before any output token exists.
+- **TPOT** — time per output token after the first (decode), one token at a time.
+- **`request_throughput`** — completed requests/sec across all concurrent traffic.
+
+**TTFT vs. total latency.** Inputs average ~367 tokens, outputs ~58–60 — over 6:1, why TTFT
+is tracked separately for this workload. But it's not the biggest cost: at concurrency 32
+(FP8), TTFT is 47.7ms vs. decode (`TPOT × output_tokens`) ≈321ms — TTFT is only ~13% of the
+≈369ms total. Decode dominates because it's sequential; prefill is one parallel pass.
+
+**KV-cache gap.** Not logged yet — neither bench run captures anything cache-related.
+vLLM exposes it via its own `/metrics` endpoint (`vllm:kv_cache_usage_perc`); scraping that
+alongside a future benchmark run is coming soon.
+
+**Throughput numbers.** `output_throughput` (tokens/s, all requests summed) climbs 208→4,890
+tok/s (FP8, c1→c64) — more requests sharing each decode step, not faster individual
+generation. `mean_tpot` moves the opposite way, getting worse with concurrency (FP8:
+4.62→6.20ms) for the same reason. `request_throughput` should track both
+(`~concurrency / (TTFT + output_tokens × TPOT)`), but at concurrency 32 it improves +43%
+against only −27% TPOT and flat TTFT — a gap this data doesn't explain.
+
 **Confirmed constraints:**
 - Serving budget: **1× H100, 32 concurrent requests** in production.
 - Training data: [`Team-ACE/ToolACE`](https://huggingface.co/datasets/Team-ACE/ToolACE)
