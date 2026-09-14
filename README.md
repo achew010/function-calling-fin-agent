@@ -120,44 +120,47 @@ slice) dropped from 1.0 at baseline to 0.722 after SFT.
 
 ### 4. Serving: FP8 quantization and concurrency
 
-`tox -e vllm-bench` sweep, 1,000 prompts per concurrency level, same SFT checkpoint served
-four ways
-([bf16](http://localhost:5000/#/experiments/9/runs/6767d0a256614bb0a25bd8df495a6be6) ·
-[FP8 weights](http://localhost:5000/#/experiments/9/runs/d4dd247ca01d466a8f0734be6776d7a3) ·
-[FP8 weights+KV](http://localhost:5000/#/experiments/9/runs/7c1003fde41749fca6b02a792eb29d13) ·
-[FP8 weights+KV+DFlash](http://localhost:5000/#/experiments/9/runs/9bfaa6aceb004480bbff35c833fb30a5)):
+`tox -e vllm-bench` sweep, 1,000 prompts per concurrency level, `--gpu-memory-utilization
+0.8` (this repo's current default — supersedes an earlier 0.5-utilization pass), same SFT
+checkpoint served four ways
+([bf16](http://localhost:5000/#/experiments/9/runs/462ea1f8be9c414bb91fade18616a36c) ·
+[FP8 weights](http://localhost:5000/#/experiments/9/runs/3503ae51695f45bda0410760f09ad58f) ·
+[FP8 weights+KV](http://localhost:5000/#/experiments/9/runs/d3711a55b7f3470b80abf6d9fe760bcf) ·
+[FP8 weights+KV+DFlash](http://localhost:5000/#/experiments/9/runs/a71804f18b0640f2a80b2cf3f466ee4e)):
 
-Measured at `--gpu-memory-utilization 0.5` — every serving template in this repo has
-since been bumped to 0.8 for more KV-cache headroom (not yet re-verified against a real
-run), so these numbers predate that change; expect the real curves, especially KV-cache
-%, to look different on a rerun.
+![Median TTFT/TPOT, RPS, TPS, and KV-cache utilization vs. concurrency, all four variants, gpu_memory_utilization=0.8](docs/assets/four_variant_comparison_080.png)
 
-![Median TTFT/TPOT, TPS, and KV-cache utilization vs. concurrency, all four variants](docs/assets/four_variant_comparison_median.png)
+**TTFT** — fp8 and fp8+kv are now nearly identical (16→35ms) — at 0.8 there's already
+enough cache headroom that fp8+kv's extra savings barely register. DFlash still highest
+everywhere (21→65ms), same drafter-overhead story as before.
 
-**TTFT** — monotonic rise for all four; fp8+kv lowest and flattest (17→35ms); DFlash
-highest (21→102ms) — likely the drafter's own prefill pass adding to time-to-first-token.
+**TPOT** — DFlash still wins decisively, and the margin holds up much better under load
+than at 0.5 utilization: 3.7× faster than baseline at c1, still 2.75× at c64 (vs. only
+1.6× at c64 under the old setting). Likely: more memory headroom gives the drafter room
+to work even as concurrency rises, instead of getting squeezed out.
 
-**TPOT** — DFlash wins everywhere, 3.7× at c1 narrowing to 1.6× at c64: multiple tokens
-land per forward pass, so per-token time drops. The narrowing gap is likely spare-GPU-
-capacity shrinking under load.
+**RPS** (`request_throughput`) — DFlash leads at every concurrency, including c64 (177
+vs. fp8's 132 req/s) — a reversal from the 0.5 run, where fp8+kv overtook DFlash at c64.
+Plain fp8 now slightly beats fp8+kv at c32/c64 too. Likely: at 0.5, cache headroom was
+the scarce resource fp8+kv was winning on; at 0.8 that scarcity is gone, so DFlash's raw
+per-token speed dominates instead.
 
-**TPS** — DFlash leads through c32; fp8+kv overtakes at c64 (6,670 vs. 5,862 tok/s).
-Plausible read: DFlash's win is a per-token speed effect that doesn't scale with
-concurrency, while fp8+kv's is a memory-headroom effect that keeps compounding as
-concurrency rises.
+**TPS** (`output_throughput`) — same story as RPS: DFlash leads at every concurrency (up
+to 10,020 tok/s at c64), no longer overtaken by fp8+kv the way it was at 0.5.
 
-**KV-cache %** — baseline > fp8 > dflash > fp8+kv. fp8+kv at ~1/4 of baseline's usage
-(1.6% vs. 6.5% at c64) directly confirms FP8 KV-cache halves memory per token. DFlash
-using more cache than fp8+kv despite the same dtype (3.1% vs. 1.6%) is likely the
-drafter model's own cache footprint on top.
+**KV-cache %** — all four use roughly half the percentage they did at 0.5 (bigger pool,
+same absolute data), as expected. The gap between DFlash and fp8+kv nearly closed (1.07%
+vs. 0.88% at c64, was ~2× apart at 0.5) — the drafter's fixed memory overhead matters
+less as a share of a bigger pool.
 
-**Summary:** DFlash wins on latency (TPOT) but costs TTFT and cache headroom; fp8+kv is
-the more efficient, scalable choice and takes raw throughput at the highest concurrency
-tested.
+**Summary:** the 0.5→0.8 bump didn't just shift the curves, it flipped which variant wins
+on throughput. At 0.5, scarce memory headroom let fp8+kv's cache savings win at high
+concurrency; at 0.8, headroom stops being the bottleneck and DFlash's per-token speed
+wins outright on every metric except TTFT.
 
 The production serving budget below is 32 concurrent requests — the benchmark's
-`--concurrencies 32` row. Measured `request_throughput` there: 46.5 req/s (bf16), 61.6
-(FP8 weights), 86.2 (FP8 weights+KV), 88.6 (FP8 weights+KV+DFlash) — all four clear it.
+`--concurrencies 32` row. Measured `request_throughput` there: 52.1 req/s (bf16), 83.8
+(FP8 weights), 79.1 (FP8 weights+KV), 144.0 (FP8 weights+KV+DFlash) — all four clear it.
 
 **Confirmed constraints:**
 - Serving budget: **1× H100, 32 concurrent requests** in production.
