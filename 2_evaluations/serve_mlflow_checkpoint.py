@@ -80,7 +80,7 @@ def main() -> None:
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument(
         "--max-model-len",
         type=int,

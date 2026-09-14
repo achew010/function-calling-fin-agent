@@ -26,11 +26,12 @@
 # --trust-remote-code is required -- the drafter ships custom modeling code
 # (qwen3_dflash.py upstream), not a plain AutoModelForCausalLM.
 #
-# --gpu-memory-utilization is still 0.5, unchanged from the other variants, but this one
-# also has to fit the ~1B-param drafter alongside the 8B target and its KV-cache within
-# that same budget -- watch for OOM on first launch and raise this (with real evidence,
-# not a guess -- see this project's own history of OOM-debugging-by-log for the standard
-# approach) if it doesn't fit, rather than pre-emptively bumping it here unverified.
+# --gpu-memory-utilization is 0.8, matching every other vLLM serving template in this
+# directory (bumped from an earlier, more conservative 0.5 -- see ./vllm-qwen3-8b.yaml's
+# comment for why), but this one also has to fit the ~1B-param drafter alongside the 8B
+# target and its KV-cache within that same budget -- watch for OOM on first launch and
+# lower this (with real evidence, not a guess -- see this project's own history of
+# OOM-debugging-by-log for the standard approach) if it doesn't fit.
 #
 # Render + apply by hand:
 #   sed -e 's/__NAME__/sft-fp8-dflash/g' -e 's/__RUN_ID__/<run id>/g' \
@@ -107,7 +108,7 @@ spec:
               exec vllm serve /model
               --served-model-name Qwen/Qwen3-8B
               --trust-remote-code
-              --gpu-memory-utilization 0.5
+              --gpu-memory-utilization 0.8
               --max-model-len 40960
               --quantization fp8_per_tensor
               --kv-cache-dtype fp8_e4m3

@@ -127,6 +127,11 @@ four ways
 [FP8 weights+KV](http://localhost:5000/#/experiments/9/runs/7c1003fde41749fca6b02a792eb29d13) ·
 [FP8 weights+KV+DFlash](http://localhost:5000/#/experiments/9/runs/9bfaa6aceb004480bbff35c833fb30a5)):
 
+Measured at `--gpu-memory-utilization 0.5` — every serving template in this repo has
+since been bumped to 0.8 for more KV-cache headroom (not yet re-verified against a real
+run), so these numbers predate that change; expect the real curves, especially KV-cache
+%, to look different on a rerun.
+
 ![Median TTFT/TPOT, TPS, and KV-cache utilization vs. concurrency, all four variants](docs/assets/four_variant_comparison_median.png)
 
 **TTFT** — monotonic rise for all four; fp8+kv lowest and flattest (17→35ms); DFlash
@@ -463,7 +468,7 @@ loop automatically:
   # then --label fp8_per_tensor, --label fp8_weights_and_kv, --label fp8_weights_kv_dflash
 ```
 
-Keep `--gpu-memory-utilization` identical (0.5) across all four or the comparison
+Keep `--gpu-memory-utilization` identical (0.8) across all four or the comparison
 confounds two variables. The benchmark logs `kv_cache_usage_perc_mean`/`_max` (scraped
 from the server's own `/metrics`) alongside throughput/TTFT/TPOT — the number to check
 whether `--kv-cache-dtype fp8_e4m3` actually grows usable cache headroom, rather than

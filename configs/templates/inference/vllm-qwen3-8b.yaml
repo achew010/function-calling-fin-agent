@@ -42,8 +42,11 @@ spec:
           # server logged "KV cache size: 126,928 tokens" (~56KB/token for Qwen3-8B's
           # GQA config) for ~17.4 GiB; 0.5 grows that pool roughly proportionally, giving
           # headroom for concurrent requests without the per-request ceiling eating
-          # nearly all of it. An H100 has plenty of room to raise this further if you
-          # want more concurrency headroom.
+          # nearly all of it. Bumped again, 0.5->0.8: an H100 has plenty of room, and the
+          # four-variant vLLM bench (root README's step 5) showed real benefit from the
+          # extra KV-cache headroom at concurrency, so applied here and to every other
+          # vLLM serving template in this directory for consistency (BFCL accuracy runs
+          # and the latency benchmark should share the same memory budget, not diverge).
           #
           # Bumped again, 32768 -> 40960 (Qwen3-8B's actual native max, matching the
           # note above): BFCL's own OSS handler doesn't ask the server what its real
@@ -84,7 +87,7 @@ spec:
             - >-
               exec vllm serve Qwen/Qwen3-8B
               --served-model-name Qwen/Qwen3-8B
-              --gpu-memory-utilization 0.5
+              --gpu-memory-utilization 0.8
               --max-model-len 40960
               --enable-auto-tool-choice
               --tool-call-parser qwen3_xml
