@@ -120,42 +120,39 @@ slice) dropped from 1.0 at baseline to 0.722 after SFT.
 
 ### 4. Serving: FP8 quantization and concurrency
 
-![Request throughput and TPOT vs. concurrency, bf16 baseline vs. FP8](docs/assets/fp8_vs_baseline_concurrency.png)
+`tox -e vllm-bench` sweep, 1,000 prompts per concurrency level, same SFT checkpoint served
+four ways
+([bf16](http://localhost:5000/#/experiments/9/runs/6767d0a256614bb0a25bd8df495a6be6) ·
+[FP8 weights](http://localhost:5000/#/experiments/9/runs/d4dd247ca01d466a8f0734be6776d7a3) ·
+[FP8 weights+KV](http://localhost:5000/#/experiments/9/runs/7c1003fde41749fca6b02a792eb29d13) ·
+[FP8 weights+KV+DFlash](http://localhost:5000/#/experiments/9/runs/9bfaa6aceb004480bbff35c833fb30a5)):
 
-`tox -e vllm-bench` sweep, same checkpoint, bf16 vs. FP8
-([bf16](http://localhost:5000/#/experiments/9/runs/2bd5b009d1f041e0b9980b7f2b105f6a) ·
-[FP8](http://localhost:5000/#/experiments/9/runs/94c48a84f5194f2fa5ce2f8248f0ac57)):
+![Median TTFT/TPOT, TPS, and KV-cache utilization vs. concurrency, all four variants](docs/assets/four_variant_comparison_median.png)
 
-| Concurrency | req/s bf16 | req/s FP8 | TTFT ms bf16 | TTFT ms FP8 | TPOT ms bf16 | TPOT ms FP8 |
-|---|---|---|---|---|---|---|
-| 16 | 30.4 | 43.5 (+43%) | 29.3 | 25.3 | 7.41 | 5.21 |
-| 32 | 45.9 | 65.5 (+43%) | 45.8 | 47.7 | 7.64 | 5.57 |
-| 64 | 61.9 | 83.4 (+35%) | 109.0 | 95.1 | 8.19 | 6.20 |
+**TTFT** — monotonic rise for all four; fp8+kv lowest and flattest (17→35ms); DFlash
+highest (21→102ms) — likely the drafter's own prefill pass adding to time-to-first-token.
 
-**Concurrency target.** Confirmed constraint: 32 concurrent requests — the benchmark's
-`--concurrencies 32` row. Measured `request_throughput` there: 45.9 req/s (bf16), 65.5
-req/s (FP8).
+**TPOT** — DFlash wins everywhere, 3.7× at c1 narrowing to 1.6× at c64: multiple tokens
+land per forward pass, so per-token time drops. The narrowing gap is likely spare-GPU-
+capacity shrinking under load.
 
-**Three metrics:**
-- **TTFT** — prefill time: one pass over the input prompt, before any output token exists.
-- **TPOT** — time per output token after the first (decode), one token at a time.
-- **`request_throughput`** — completed requests/sec across all concurrent traffic.
+**TPS** — DFlash leads through c32; fp8+kv overtakes at c64 (6,670 vs. 5,862 tok/s).
+Plausible read: DFlash's win is a per-token speed effect that doesn't scale with
+concurrency, while fp8+kv's is a memory-headroom effect that keeps compounding as
+concurrency rises.
 
-**TTFT vs. total latency.** Inputs average ~367 tokens, outputs ~58–60 — over 6:1, why TTFT
-is tracked separately for this workload. But it's not the biggest cost: at concurrency 32
-(FP8), TTFT is 47.7ms vs. decode (`TPOT × output_tokens`) ≈321ms — TTFT is only ~13% of the
-≈369ms total. Decode dominates because it's sequential; prefill is one parallel pass.
+**KV-cache %** — baseline > fp8 > dflash > fp8+kv. fp8+kv at ~1/4 of baseline's usage
+(1.6% vs. 6.5% at c64) directly confirms FP8 KV-cache halves memory per token. DFlash
+using more cache than fp8+kv despite the same dtype (3.1% vs. 1.6%) is likely the
+drafter model's own cache footprint on top.
 
-**KV-cache gap.** Not logged yet — neither bench run captures anything cache-related.
-vLLM exposes it via its own `/metrics` endpoint (`vllm:kv_cache_usage_perc`); scraping that
-alongside a future benchmark run is coming soon.
+**Summary:** DFlash wins on latency (TPOT) but costs TTFT and cache headroom; fp8+kv is
+the more efficient, scalable choice and takes raw throughput at the highest concurrency
+tested.
 
-**Throughput numbers.** `output_throughput` (tokens/s, all requests summed) climbs 208→4,890
-tok/s (FP8, c1→c64) — more requests sharing each decode step, not faster individual
-generation. `mean_tpot` moves the opposite way, getting worse with concurrency (FP8:
-4.62→6.20ms) for the same reason. `request_throughput` should track both
-(`~concurrency / (TTFT + output_tokens × TPOT)`), but at concurrency 32 it improves +43%
-against only −27% TPOT and flat TTFT — a gap this data doesn't explain.
+The production serving budget below is 32 concurrent requests — the benchmark's
+`--concurrencies 32` row. Measured `request_throughput` there: 46.5 req/s (bf16), 61.6
+(FP8 weights), 86.2 (FP8 weights+KV), 88.6 (FP8 weights+KV+DFlash) — all four clear it.
 
 **Confirmed constraints:**
 - Serving budget: **1× H100, 32 concurrent requests** in production.
