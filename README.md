@@ -229,7 +229,7 @@ correct — two tools split it, chosen for where the GPU actually is:
 
 - **Kubernetes (`configs/`)** owns the *cluster* case: workloads that need a specific
   container image (the NGC PyTorch image for `sft`/`grpo` training vs.
-  `vllm/vllm-openai` for MTP-capable serving — genuinely different, sometimes
+  `vllm/vllm-openai` for speculative-decoding-capable serving — genuinely different, sometimes
   conflicting dependency trees that a single environment can't hold at once, confirmed
   the hard way this session when installing `vllm` into the NGC image broke
   `transformer_engine`'s CUDA library resolution), state that has to survive past any
@@ -357,9 +357,13 @@ older, broadly-supported spelling of the same thing.
 
 ### 5. vLLM latency benchmark
 
-Three steps: serve the checkpoint, port-forward it, run the benchmark. Repeat step 3 at
-each concurrency level you want (1/8/16/24/32 — see "Confirmed constraints" above); each
-run logs to MLflow as its own row, so they compare directly.
+To benchmark all four serving configs below (bf16, FP8 weights, FP8 weights+KV-cache,
+FP8 weights+KV-cache+DFlash speculative decoding) in one command, use
+`configs/templates/inference/run-vllm-bench-quantization-suite.sh` — see
+`configs/README.md`'s entry for it. Otherwise, three manual steps: serve the checkpoint,
+port-forward it, run the benchmark. Repeat step 3 at each concurrency level you want
+(1/8/16/24/32 — see "Confirmed constraints" above); each run logs to MLflow as its own
+row, so they compare directly.
 
 **1. Clear out anything already running, then serve the checkpoint on its run_id.** This
 project targets a single GPU — any other leftover `fin-agent-vllm-*` Deployment (a
@@ -396,6 +400,19 @@ sed -e 's/__NAME__/sft-kvfp8/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
   -e 's/__VLLM_EXTRA_ARGS__/--kv-cache-dtype fp8_e4m3/g' \
   configs/templates/inference/vllm-serve-checkpoint.yaml | kubectl apply -f -
 kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-kvfp8 --timeout=900s
+```
+
+**DFlash speculative decoding** (FP8 weights + FP8 KV-cache + a separate drafter model,
+`z-lab/Qwen3-8B-DFlash-b16`, proposing 4 candidate tokens per step) uses its own template
+with everything baked in — not `__VLLM_EXTRA_ARGS__`, since the drafter's model id
+collides with `sed`'s own `/` delimiter. Not MTP: MTP needs a checkpoint with a trained
+MTP head, which this project's fine-tunes don't have — see the template's header for the
+verified config, sourced from vLLM's own test suite:
+
+```bash
+sed -e 's/__NAME__/sft-fp8-dflash/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
+  configs/templates/inference/vllm-serve-checkpoint-fp8-dflash.yaml | kubectl apply -f -
+kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-fp8-dflash --timeout=900s
 ```
 
 **2. Kill any stale local port-forwards, then start fresh ones — each in its own
@@ -438,16 +455,18 @@ tool-calling traffic, no custom conversion code — but sends tools via the nati
 calls (tools as text in the system message); realistic tool-calling-*shaped* load, not an
 exact replica of this model's production request format.
 
-**Comparing quantized against bf16.** Run the sweep once per Deployment (bf16 /
-`--quantization fp8_per_tensor` / `--kv-cache-dtype fp8_e4m3`), labelling each so the runs
-are distinguishable in MLflow:
+**Comparing across variants.** Run the sweep once per Deployment (bf16 / FP8 weights /
+FP8 weights+KV-cache / FP8 weights+KV-cache+DFlash), labelling each so the runs are
+distinguishable in MLflow — `run-vllm-bench-quantization-suite.sh` does exactly this
+loop automatically:
 
 ```bash
 # ... --base-url http://localhost:8000 (whichever server is port-forwarded) ...
-  --concurrencies 1,8,16,32,64 --label bf16   # then fp8_per_tensor, then kv_cache_fp8
+  --concurrencies 1,8,16,32,64 --label bf16
+  # then --label fp8_per_tensor, --label fp8_weights_and_kv, --label fp8_weights_kv_dflash
 ```
 
-Keep `--gpu-memory-utilization` identical (0.5) across all three or the comparison
+Keep `--gpu-memory-utilization` identical (0.5) across all four or the comparison
 confounds two variables. The benchmark logs `kv_cache_usage_perc_mean`/`_max` (scraped
 from the server's own `/metrics`) alongside throughput/TTFT/TPOT — the number to check
 whether `--kv-cache-dtype fp8_e4m3` actually grows usable cache headroom, rather than
