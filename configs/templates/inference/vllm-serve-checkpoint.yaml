@@ -27,6 +27,12 @@
 #       -e 's/__VLLM_EXTRA_ARGS__/--kv-cache-dtype fp8_e4m3/g' \
 #       vllm-serve-checkpoint.yaml | kubectl apply -f -
 #
+# Both together -- __VLLM_EXTRA_ARGS__ is one flat passthrough, so combining the two
+# flags is just concatenating them:
+#   sed -e 's/__NAME__/sft-fp8-kvfp8/g' -e 's/__RUN_ID__/<run id>/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__/--quantization fp8_per_tensor --kv-cache-dtype fp8_e4m3/g' \
+#       vllm-serve-checkpoint.yaml | kubectl apply -f -
+#
 # The placeholder rides on the --max-model-len line rather than a line of its own: this
 # is a YAML FOLDED scalar (>-), where a line emptied by substitution folds to a NEWLINE
 # and would split the command (see bfcl-eval-mlflow-checkpoint-job.yaml's longer note).

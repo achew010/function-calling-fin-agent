@@ -1,11 +1,11 @@
 # Template (NOT directly kubectl-apply-able — substitute __NAME__/__RUN_ID__/
-# __CONCURRENCY__ first, see below): serves a specific MLflow-tracked run's model
-# artifact via vLLM (same Deployment+Service as ./vllm-serve-checkpoint.yaml) AND runs
-# `vllm bench serve` against it, logging results to MLflow -- all in-cluster, so there's
-# no port-forwarding to babysit across three terminals (vLLM, MLflow, the benchmark
-# itself) the way the bare `vllm-serve-checkpoint.yaml` + `tox -e vllm-bench` combo
-# needs: the Job below reaches both the vLLM Deployment and MLflow over their normal
-# in-cluster Service DNS, same as every other Job in this directory.
+# __CONCURRENCY__/__VLLM_EXTRA_ARGS__ first, see below): serves a specific MLflow-tracked
+# run's model artifact via vLLM (same Deployment+Service as ./vllm-serve-checkpoint.yaml)
+# AND runs `vllm bench serve` against it, logging results to MLflow -- all in-cluster, so
+# there's no port-forwarding to babysit across three terminals (vLLM, MLflow, the
+# benchmark itself) the way the bare `vllm-serve-checkpoint.yaml` + `tox -e vllm-bench`
+# combo needs: the Job below reaches both the vLLM Deployment and MLflow over their
+# normal in-cluster Service DNS, same as every other Job in this directory.
 #
 # __CONCURRENCY__ is a single integer, not a sweep -- `vllm bench serve` (like this
 # whole Job) measures one concurrency level per run, logged as its own MLflow run (see
@@ -16,12 +16,32 @@
 # bfcl-eval-mlflow-checkpoint-job.yaml's own teardown discipline), so only the fast
 # benchmark step is repeated, not the multi-GB checkpoint download.
 #
-# Render + apply by hand for one concurrency level:
+# __VLLM_EXTRA_ARGS__ must always be substituted (with an empty string for an
+# unquantized server) -- same requirement, same reason, as ./vllm-serve-checkpoint.yaml's
+# identical placeholder: left in place it reaches `vllm serve` as an unknown argument and
+# the container fails to start. Reusing a __NAME__ already serving unquantized bf16
+# collides with that Deployment's pod template (immutable) rather than reconfiguring it
+# -- use a distinct __NAME__ per variant, same convention as ./vllm-serve-checkpoint.yaml.
+#
+# Render + apply by hand for one concurrency level, unquantized:
 #   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__//g' \
 #       vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
 #   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft --timeout=900s
 #   kubectl -n fin-agent wait --for=condition=complete job/fin-agent-vllm-bench-sft --timeout=1800s
 #   kubectl -n fin-agent logs -l app=fin-agent-vllm-bench-sft --tail=40
+#
+# KV-cache in FP8 (see ./vllm-serve-checkpoint.yaml's header for the fuller explanation
+# of this flag -- fp8_e4m3, no calibration, vLLM's own documented default):
+#   sed -e 's/__NAME__/sft-kvfp8/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__/--kv-cache-dtype fp8_e4m3/g' \
+#       vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
+#
+# Both weights AND KV-cache in FP8 together -- __VLLM_EXTRA_ARGS__ is one flat
+# passthrough, so combining the two flags is just concatenating them:
+#   sed -e 's/__NAME__/sft-fp8-kvfp8/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__/--quantization fp8_per_tensor --kv-cache-dtype fp8_e4m3/g' \
+#       vllm-bench-mlflow-checkpoint-job.yaml | kubectl apply -f -
 #
 # Prerequisites:
 #   1. setup/setup.sh (creates the namespace + MLflow this job pulls from and logs to)
@@ -33,8 +53,10 @@
 #     --from-file=log_vllm_bench_to_mlflow.py=2_evaluations/log_vllm_bench_to_mlflow.py
 #
 # Clean up everything, including the vLLM Deployment (unlike a normal rerun at a new
-# __CONCURRENCY__, which leaves it running -- see above):
+# __CONCURRENCY__, which leaves it running -- see above). __VLLM_EXTRA_ARGS__ must still
+# be substituted here too -- kubectl delete -f - still has to parse valid YAML first:
 #   sed -e 's/__NAME__/sft/g' -e 's/__RUN_ID__/<run id>/g' -e 's/__CONCURRENCY__/32/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__//g' \
 #       vllm-bench-mlflow-checkpoint-job.yaml | kubectl delete -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -96,7 +118,10 @@ spec:
           # behind every flag here (max-model-len, tool-choice/tool-call-parser,
           # default-chat-template-kwargs) -- kept in sync with that file by hand since
           # this is a bundled copy, same convention as
-          # ./bfcl-eval-mlflow-checkpoint-job.yaml's own Deployment.
+          # ./bfcl-eval-mlflow-checkpoint-job.yaml's own Deployment. __VLLM_EXTRA_ARGS__
+          # rides on the --max-model-len line rather than a line of its own for the same
+          # YAML folded-scalar reason as ./vllm-serve-checkpoint.yaml's own placeholder --
+          # a line emptied by substitution folds to a NEWLINE and would split the command.
           command:
             - sh
             - -c
@@ -104,7 +129,7 @@ spec:
               exec vllm serve /model
               --served-model-name Qwen/Qwen3-8B
               --gpu-memory-utilization 0.5
-              --max-model-len 40960
+              --max-model-len 40960 __VLLM_EXTRA_ARGS__
               --enable-auto-tool-choice
               --tool-call-parser qwen3_xml
               --default-chat-template-kwargs '{"enable_thinking": false}'
