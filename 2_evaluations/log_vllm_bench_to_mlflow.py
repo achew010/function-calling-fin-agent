@@ -13,6 +13,14 @@ generated_texts, errors, ...) are skipped -- MLflow metrics must be scalars, and
 are exactly the detail save_to_pytorch_benchmark_format's own ignored_metrics list
 already excludes for the same reason.
 
+Also logs `kv_cache_usage_perc_mean`/`_max`: `vllm bench serve` only ever sees
+client-observed latency/throughput, never the server's own KV-cache occupancy, so this
+script separately polls the target server's `/metrics` endpoint (Prometheus text format,
+`vllm:kv_cache_usage_perc` -- exposed by vLLM's OpenAI-compatible server by default, no
+extra server flag needed) once a second for the duration of each `vllm bench serve` call.
+Missing if the endpoint is unreachable or the vLLM build doesn't expose it -- logged as a
+stderr warning, not a failure.
+
 Usage (against an already-running, OpenAI-compatible vLLM server -- e.g.
 configs/templates/inference/vllm-serve-checkpoint.yaml port-forwarded to localhost:8000,
 see root README's step 5):
@@ -50,9 +58,41 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import mlflow
+from prometheus_client.parser import text_string_to_metric_families
+
+# vLLM's own KV-cache occupancy gauge, exposed on its OpenAI-compatible server's
+# /metrics endpoint (Prometheus text format) by default -- verified against vLLM's
+# current source (vllm/v1/metrics/loggers.py) and its own test suite
+# (tests/entrypoints/serve/instrumentator/test_metrics.py hits server_url + "/metrics"
+# with no extra server flag needed), not assumed. `vllm bench serve` itself never sees
+# this -- it only measures client-observed latency/throughput -- so it has to be
+# scraped from the server independently, while the benchmark subprocess runs.
+KV_CACHE_METRIC_NAME = "vllm:kv_cache_usage_perc"
+KV_CACHE_POLL_INTERVAL_S = 1.0
+
+
+def poll_kv_cache_usage(metrics_url: str, samples: list[float], stop_event: threading.Event) -> None:
+    """Background poller: scrapes `metrics_url` every KV_CACHE_POLL_INTERVAL_S seconds
+    for KV_CACHE_METRIC_NAME, appending each reading to `samples`. Best-effort --
+    an unreachable endpoint (e.g. an older vLLM build, or metrics disabled) just means
+    no samples get collected; it must never fail the benchmark subprocess it runs
+    alongside."""
+    while not stop_event.is_set():
+        try:
+            with urllib.request.urlopen(metrics_url, timeout=5) as resp:
+                text = resp.read().decode()
+            for family in text_string_to_metric_families(text):
+                if family.name == KV_CACHE_METRIC_NAME:
+                    samples.extend(sample.value for sample in family.samples)
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            pass
+        stop_event.wait(KV_CACHE_POLL_INTERVAL_S)
 
 # Per-request raw data in vllm bench serve's --save-result JSON -- large, and not
 # scalars, so not loggable (or useful) as MLflow metrics. Matches
@@ -159,10 +199,32 @@ def run_once(args: argparse.Namespace, concurrency: int, extra_vllm_args: list[s
         ]
         cmd += extra_vllm_args
 
-        print(f"[log_vllm_bench_to_mlflow] $ {' '.join(cmd)}", file=sys.stderr)
-        subprocess.run(cmd, check=True)
+        kv_cache_samples: list[float] = []
+        stop_event = threading.Event()
+        poller = threading.Thread(
+            target=poll_kv_cache_usage,
+            args=(f"{args.base_url}/metrics", kv_cache_samples, stop_event),
+            daemon=True,
+        )
+        poller.start()
+        try:
+            print(f"[log_vllm_bench_to_mlflow] $ {' '.join(cmd)}", file=sys.stderr)
+            subprocess.run(cmd, check=True)
+        finally:
+            stop_event.set()
+            poller.join(timeout=KV_CACHE_POLL_INTERVAL_S + 5)
 
         result = json.loads(result_path.read_text())
+
+    if kv_cache_samples:
+        mlflow.log_metric(f"{prefix}kv_cache_usage_perc_mean", sum(kv_cache_samples) / len(kv_cache_samples))
+        mlflow.log_metric(f"{prefix}kv_cache_usage_perc_max", max(kv_cache_samples))
+    else:
+        print(
+            f"[log_vllm_bench_to_mlflow] no {KV_CACHE_METRIC_NAME} samples collected from "
+            f"{args.base_url}/metrics -- endpoint unreachable, or this vLLM build doesn't expose it",
+            file=sys.stderr,
+        )
 
     for key, value in result.items():
         if key in LIST_VALUED_KEYS:
