@@ -2,10 +2,8 @@
 # __TEST_CATEGORIES__ first, see below): BFCL evaluation against a specific MLflow-
 # tracked run's model artifact, with its own bundled vLLM Deployment that pulls the
 # model via mlflow.artifacts.download_artifacts(run_id=__RUN_ID__) — same mechanism as
-# ../inference/vllm-grpo-mtp.yaml, minus that file's MTP/structured-outputs flags (this
-# is a correctness eval; speculative decoding would just fail to start on a checkpoint
-# with no trained MTP head, and BFCL doesn't send guided_json requests that would
-# exercise structured-output decoding anyway).
+# ../inference/vllm-serve-checkpoint.yaml, minus any quantization/speculative-decoding
+# flags (this is a correctness eval, not a serving-config benchmark).
 #
 # __TEST_CATEGORIES__ is a space-separated, unquoted list substituted straight into a
 # bash `for category in __TEST_CATEGORIES__; do ... done` loop — one

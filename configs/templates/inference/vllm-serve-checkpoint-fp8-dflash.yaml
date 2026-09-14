@@ -1,0 +1,153 @@
+# Template (NOT directly kubectl-apply-able — substitute __NAME__/__RUN_ID__ first, see
+# below): serves a specific MLflow-tracked run's model artifact via vLLM with weights AND
+# KV-cache in FP8 PLUS DFlash speculative decoding — everything baked in, not routed
+# through __VLLM_EXTRA_ARGS__ like ./vllm-serve-checkpoint.yaml's other variants. That
+# placeholder is a flat sed substitution, and DFlash's --speculative-config value is a
+# JSON blob containing a model id with a literal "/" in it
+# (z-lab/Qwen3-8B-DFlash-b16) -- colliding with sed's own "/" delimiter and requiring
+# nested shell-quote escaping inside a --VLLM_EXTRA_ARGS__ substitution not worth
+# inflicting on whoever has to type this by hand. Baking it in avoids that entirely.
+#
+# --quantization fp8_per_tensor / --kv-cache-dtype fp8_e4m3: see
+# ./vllm-serve-checkpoint.yaml's header for the fuller explanation of each.
+#
+# DFlash, NOT MTP: MTP needs the TARGET checkpoint itself to have a trained MTP head,
+# which this project's plain dense Qwen3-8B fine-tunes do not have -- confirmed to fail
+# at load against them (the MTP template this project previously had for this was removed
+# for exactly that reason; see 2_evaluations/README.md's note on this). DFlash is
+# different: a separate, standalone ~1B drafter model
+# (z-lab/Qwen3-8B-DFlash-b16) proposes candidate tokens, verified by the target model via
+# rejection sampling -- the target needs no special training, so it works against this
+# project's actual fine-tuned checkpoints. Verified directly against vLLM's own test
+# suite (tests/v1/e2e/spec_decode/acceptance_rates/dflash/test_dflash.py), which pairs
+# exactly this drafter with a Qwen/Qwen3-8B target -- not assumed or guessed at:
+#   speculative_config={"method": "dflash", "model": "z-lab/Qwen3-8B-DFlash-b16",
+#                        "num_speculative_tokens": 4, "max_model_len": 32768}
+# --trust-remote-code is required -- the drafter ships custom modeling code
+# (qwen3_dflash.py upstream), not a plain AutoModelForCausalLM.
+#
+# --gpu-memory-utilization is still 0.5, unchanged from the other variants, but this one
+# also has to fit the ~1B-param drafter alongside the 8B target and its KV-cache within
+# that same budget -- watch for OOM on first launch and raise this (with real evidence,
+# not a guess -- see this project's own history of OOM-debugging-by-log for the standard
+# approach) if it doesn't fit, rather than pre-emptively bumping it here unverified.
+#
+# Render + apply by hand:
+#   sed -e 's/__NAME__/sft-fp8-dflash/g' -e 's/__RUN_ID__/<run id>/g' \
+#       vllm-serve-checkpoint-fp8-dflash.yaml | kubectl apply -f -
+#   kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-fp8-dflash --timeout=900s
+#
+# Prerequisites:
+#   1. setup/setup.sh (creates the namespace + MLflow this job pulls from)
+#   2. The MLflow run must have a "model" artifact (train_sft.py/train_grpo.py with
+#      --mlflow both log one, at mlflow.log_artifacts(..., artifact_path="model"))
+#
+# Clean up (a Deployment — it never exits on its own):
+#   sed -e 's/__NAME__/sft-fp8-dflash/g' -e 's/__RUN_ID__/<run id>/g' \
+#       vllm-serve-checkpoint-fp8-dflash.yaml | kubectl delete -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: fin-agent-vllm-__NAME__ }
+  template:
+    metadata:
+      labels: { app: fin-agent-vllm-__NAME__ }
+    spec:
+      runtimeClassName: nvidia
+      initContainers:
+        - name: fetch-model
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -f /model/config.json ]; then
+                echo "model already staged in /model, skipping download"
+              else
+                pip install --no-cache-dir mlflow
+                python3 -c "
+              import pathlib, mlflow
+              # See ./vllm-serve-checkpoint.yaml's identical block for why this flatten
+              # step is needed -- download_artifacts nests under artifact_path.
+              src = pathlib.Path(mlflow.artifacts.download_artifacts(
+                  run_id='__RUN_ID__', artifact_path='model', dst_path='/model/.staging'))
+              dest = pathlib.Path('/model')
+              for item in src.iterdir():
+                  item.rename(dest / item.name)
+              "
+                rm -rf /model/.staging
+              fi
+              test -f /model/config.json || { echo "no config.json in /model after download"; ls -laR /model; exit 1; }
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: http://mlflow.fin-agent.svc.cluster.local:5000
+          volumeMounts:
+            - { name: mlflow-artifacts, mountPath: /data/artifacts, readOnly: true }
+            - { name: model-cache, mountPath: /model }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:cu130-nightly   # same image as ./vllm-serve-checkpoint.yaml
+          imagePullPolicy: IfNotPresent
+          # See ./vllm-serve-checkpoint.yaml's identical flags (served-model-name,
+          # max-model-len, tool-choice/tool-call-parser, default-chat-template-kwargs)
+          # for the full reasoning behind each -- kept in sync by hand, same convention
+          # as ./vllm-bench-mlflow-checkpoint-job.yaml's own bundled Deployment.
+          command:
+            - sh
+            - -c
+            - >-
+              exec vllm serve /model
+              --served-model-name Qwen/Qwen3-8B
+              --trust-remote-code
+              --gpu-memory-utilization 0.5
+              --max-model-len 40960
+              --quantization fp8_per_tensor
+              --kv-cache-dtype fp8_e4m3
+              --speculative-config '{"method": "dflash", "model": "z-lab/Qwen3-8B-DFlash-b16", "num_speculative_tokens": 4, "max_model_len": 32768}'
+              --enable-auto-tool-choice
+              --tool-call-parser qwen3_xml
+              --default-chat-template-kwargs '{"enable_thinking": false}'
+              --host 0.0.0.0 --port 8000
+          env:
+            - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+              value: "1"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 80            # ~20 min budget -- includes the MLflow-artifact download and the drafter's own download, not just weight load
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+          volumeMounts:
+            - { name: model-cache, mountPath: /model, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: mlflow-artifacts
+          persistentVolumeClaim: { claimName: fin-agent-mlflow-artifacts }
+        - name: model-cache
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fin-agent-vllm-__NAME__
+  namespace: fin-agent
+spec:
+  selector: { app: fin-agent-vllm-__NAME__ }
+  ports:
+    - port: 8000
+      targetPort: 8000

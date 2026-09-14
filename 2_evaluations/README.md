@@ -216,10 +216,13 @@ kubectl -n fin-agent delete deployment fin-agent-vllm-sft
 kubectl -n fin-agent delete service fin-agent-vllm-sft --ignore-not-found
 ```
 
-Don't use `vllm-grpo-mtp.yaml` for this — it bakes in `--speculative-config
-'{"method": "mtp", ...}'`, which needs a checkpoint with a trained MTP head. Every
-checkpoint this project actually produces is a plain dense Qwen3-8B merge, which doesn't
-have one, and that template will fail to start on it.
+For speculative decoding, use `configs/templates/inference/vllm-serve-checkpoint-fp8-dflash.yaml`
+(DFlash, not MTP) — MTP needs a checkpoint with a trained MTP head, which every checkpoint
+this project actually produces (a plain dense Qwen3-8B merge) doesn't have; a
+`--speculative-config '{"method": "mtp", ...}'` config fails to start on one. DFlash pairs
+a separate, standalone drafter model (`z-lab/Qwen3-8B-DFlash-b16`) with the target via
+rejection sampling instead, so it works against this project's own fine-tunes — see that
+file's header for the full explanation and the verified vLLM config.
 
 ### Option B — bare GPU host, no kube (via `tox`)
 

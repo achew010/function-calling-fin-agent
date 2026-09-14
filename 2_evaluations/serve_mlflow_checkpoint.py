@@ -1,7 +1,7 @@
 """Serve a specific MLflow run's model artifact via vLLM -- the no-kube analogue of
-configs/templates/inference/vllm-grpo-mtp.yaml's initContainer (download by run_id) +
-vllm serve, collapsed into one process since there's no separate init/main container
-split to put them in on a bare host.
+configs/templates/inference/vllm-serve-checkpoint.yaml's initContainer (download by
+run_id) + vllm serve, collapsed into one process since there's no separate init/main
+container split to put them in on a bare host.
 
 Usage:
     python serve_mlflow_checkpoint.py --run-id e783b52f2b7a42cc8ff2b2786949cb71 \
@@ -118,7 +118,7 @@ def main() -> None:
             )
             # download_artifacts nests its output under a directory named after
             # artifact_path -- verified directly against mlflow, not assumed (same
-            # finding documented in vllm-grpo-mtp.yaml's initContainer): dst_path=X,
+            # finding documented in vllm-serve-checkpoint.yaml's initContainer): dst_path=X,
             # artifact_path="model" returns X/model, i.e. exactly model_dir above.
             # This assert exists to catch mlflow ever changing that behavior loudly,
             # rather than silently pointing vllm at the wrong directory.
