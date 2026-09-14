@@ -196,6 +196,39 @@ python train_grpo.py \
   --num-generations 8 --lr 1e-6 --epochs 1
 ```
 
+### What happened in the first pilot run
+
+MLflow run [`94a862f8`](http://localhost:5000/#/experiments/6/runs/94a862f8abc34fb1bd19d78572855292) (256 pilot
+targets, 100 update steps, `--num-generations 4`, default linear LR schedule starting at `1e-6`,
+`--kl-beta 0`): in plain terms, the model didn't change.
+
+![Reward vs. real accuracy over the run](assets/pilot_reward_vs_accuracy.png)
+
+Training reward bounced between roughly 0.5 and 0.9 every step with no upward trend, and the
+held-out accuracy numbers (`eval_fc_call_correctness`, `eval_balanced_call_accuracy`, the
+call-only and no-call-only slices) came back **bit-for-bit identical** at every evaluation
+checkpoint — step 0, 25, 50, 75, and 100. The model's actual predictions on held-out data never
+moved at all, despite 100 real training steps.
+
+![Likely causes of the plateau](assets/pilot_plateau_causes.png)
+
+Two things in the same run explain why:
+
+- **Most sampled prompt groups had no learning signal.** 70–85% of the groups, most steps, scored
+  every one of their `G` completions identically (zero reward spread) — see the "reward std"
+  explanation above. A tied group contributes zero gradient, so most of the 100 steps weren't
+  actually teaching the model anything.
+- **The learning rate decayed to almost nothing.** The default linear schedule took `--lr 1e-6`
+  down to `~1e-8` by step 100 — a 100x drop. Even the minority of steps that *did* have real signal
+  were applying a vanishingly small update by the back half of the run.
+
+This wasn't the SFT checkpoint already being "as good as it gets" — reward never got close to its
+1.0 ceiling. It's that this particular pilot configuration didn't give the optimizer enough
+live signal, at a high enough learning rate, to actually move the policy. Next things to try:
+turn on `--select-by-rollout` (directly targets the tied-group problem above), and swap the
+decaying `linear` schedule for `constant_with_warmup` on a short run like this, where the decay
+tail was doing more harm than good.
+
 ## Rollout generation and batch sizing
 
 Rollout generation is what makes a GRPO step expensive: `--num-generations` (8)
