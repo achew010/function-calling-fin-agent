@@ -40,7 +40,7 @@ project's own eval set instead of the public one.
 
 ![SFT eval_fc_call_correctness rising from 0.574 to 0.675 over training](docs/assets/sft_eval_fc_call_correctness.png)
 
-The run (`thundering-worm-655`, [MLflow](http://localhost:5000/#/experiments/5/runs/ba61b7db97b24406b608ffa8ee2deae6/model-metrics)):
+The run (`thundering-worm-655`, run_id `ba61b7db97b24406b608ffa8ee2deae6`):
 
 | Metric | Start (step 0) | End (step 738, 1 epoch) |
 |---|---|---|
@@ -79,7 +79,7 @@ gap. That's the failure surface GRPO targets next.
 ### 2. GRPO: the attempt, and what the numbers say didn't work
 
 Warm-started from the SFT checkpoint (`sedate-sheep-553`, a 256-prompt/100-step pilot,
-[MLflow](http://localhost:5000/#/experiments/6/runs/94a862f8abc34fb1bd19d78572855292)).
+run_id `94a862f8abc34fb1bd19d78572855292`).
 `compute_reward` in [train_grpo.py](1_training/2_grpo/train_grpo.py) cascades by
 severity — hallucinated call worst, then wrong function, then missing/extra invocations,
 then partial credit for argument correctness — covering the same failure surface as the
@@ -109,9 +109,9 @@ Full `python`-category BFCL (3,491 cases):
 | `bfcl_live_ast_accuracy` | 0.720 | **0.790** (+7.0) | 0.784 | 0.801 |
 | `bfcl_overall_accuracy` | 0.785 | **0.835** (+5.0) | 0.831 | — |
 
-([baseline](http://localhost:5000/#/experiments/7/runs/b8f2e219f2f0463b9d62f0d0a56c6567) ·
-[SFT](http://localhost:5000/#/experiments/8/runs/b5a846123ee6431b850555b851d31e6c) ·
-[SFT+FP8](http://localhost:5000/#/experiments/11/runs/44efe2b96bb74385a0e4dd0620e174af))
+(run_ids: baseline `b8f2e219f2f0463b9d62f0d0a56c6567` ·
+SFT `b5a846123ee6431b850555b851d31e6c` ·
+SFT+FP8 `44efe2b96bb74385a0e4dd0620e174af`)
 
 SFT clears the leaderboard reference on Non-Live and closes nearly all the gap on Live
 (0.790 vs. 0.801, within this suite's ±1.7-pt noise band at this sample size). FP8 costs
@@ -121,42 +121,37 @@ slice) dropped from 1.0 at baseline to 0.722 after SFT.
 ### 4. Serving: FP8 quantization and concurrency
 
 `tox -e vllm-bench` sweep, 1,000 prompts per concurrency level, `--gpu-memory-utilization
-0.8` (this repo's current default — supersedes an earlier 0.5-utilization pass), same SFT
-checkpoint served four ways
-([bf16](http://localhost:5000/#/experiments/9/runs/462ea1f8be9c414bb91fade18616a36c) ·
-[FP8 weights](http://localhost:5000/#/experiments/9/runs/3503ae51695f45bda0410760f09ad58f) ·
-[FP8 weights+KV](http://localhost:5000/#/experiments/9/runs/d3711a55b7f3470b80abf6d9fe760bcf) ·
-[FP8 weights+KV+DFlash](http://localhost:5000/#/experiments/9/runs/a71804f18b0640f2a80b2cf3f466ee4e)):
+0.8` (this repo's current default), same SFT checkpoint served four ways (run_ids: bf16
+`462ea1f8be9c414bb91fade18616a36c` · FP8 weights `3503ae51695f45bda0410760f09ad58f` ·
+FP8 weights+KV `d3711a55b7f3470b80abf6d9fe760bcf` · FP8 weights+KV+DFlash
+`a71804f18b0640f2a80b2cf3f466ee4e`):
 
 ![Median TTFT/TPOT, RPS, TPS, and KV-cache utilization vs. concurrency, all four variants, gpu_memory_utilization=0.8](docs/assets/four_variant_comparison_080.png)
 
-**TTFT** — fp8 and fp8+kv are now nearly identical (16→35ms) — at 0.8 there's already
-enough cache headroom that fp8+kv's extra savings barely register. DFlash still highest
-everywhere (21→65ms), same drafter-overhead story as before.
+**TTFT** — fp8 and fp8+kv are nearly identical (16→35ms) — at this memory budget
+there's already enough cache headroom that fp8+kv's extra savings barely register.
+DFlash is highest everywhere (21→65ms), likely the drafter's own prefill pass adding to
+time-to-first-token.
 
-**TPOT** — DFlash still wins decisively, and the margin holds up much better under load
-than at 0.5 utilization: 3.7× faster than baseline at c1, still 2.75× at c64 (vs. only
-1.6× at c64 under the old setting). Likely: more memory headroom gives the drafter room
-to work even as concurrency rises, instead of getting squeezed out.
+**TPOT** — DFlash wins decisively at every concurrency, 3.7× faster than baseline at c1,
+still 2.75× faster at c64. Multiple tokens land per forward pass, so per-token time
+drops; the margin holding up under load suggests the drafter has enough spare memory
+headroom to keep working even as concurrency rises.
 
 **RPS** (`request_throughput`) — DFlash leads at every concurrency, including c64 (177
-vs. fp8's 132 req/s) — a reversal from the 0.5 run, where fp8+kv overtook DFlash at c64.
-Plain fp8 now slightly beats fp8+kv at c32/c64 too. Likely: at 0.5, cache headroom was
-the scarce resource fp8+kv was winning on; at 0.8 that scarcity is gone, so DFlash's raw
+vs. fp8's 132 req/s). Plain fp8 slightly beats fp8+kv at c32/c64 — with cache headroom
+no longer scarce, fp8+kv's savings stop being a throughput advantage and DFlash's raw
 per-token speed dominates instead.
 
-**TPS** (`output_throughput`) — same story as RPS: DFlash leads at every concurrency (up
-to 10,020 tok/s at c64), no longer overtaken by fp8+kv the way it was at 0.5.
+**TPS** (`output_throughput`) — same story as RPS: DFlash leads at every concurrency, up
+to 10,020 tok/s at c64.
 
-**KV-cache %** — all four use roughly half the percentage they did at 0.5 (bigger pool,
-same absolute data), as expected. The gap between DFlash and fp8+kv nearly closed (1.07%
-vs. 0.88% at c64, was ~2× apart at 0.5) — the drafter's fixed memory overhead matters
-less as a share of a bigger pool.
+**KV-cache %** — baseline > fp8 > dflash ≈ fp8+kv, with DFlash and fp8+kv close (1.07%
+vs. 0.88% at c64) despite DFlash carrying a separate drafter model's own cache footprint
+— likely small relative to the overall pool at this memory budget.
 
-**Summary:** the 0.5→0.8 bump didn't just shift the curves, it flipped which variant wins
-on throughput. At 0.5, scarce memory headroom let fp8+kv's cache savings win at high
-concurrency; at 0.8, headroom stops being the bottleneck and DFlash's per-token speed
-wins outright on every metric except TTFT.
+**Summary:** DFlash wins on every metric here except TTFT, where the drafter's extra
+prefill pass costs it consistently.
 
 The production serving budget below is 32 concurrent requests — the benchmark's
 `--concurrencies 32` row. Measured `request_throughput` there: 52.1 req/s (bf16), 83.8
