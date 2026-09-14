@@ -387,6 +387,17 @@ sed -e 's/__NAME__/sft-fp8/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
 kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-fp8 --timeout=900s
 ```
 
+**KV-cache in FP8** is a separate flag (`--kv-cache-dtype`, not `--quantization`) —
+quantizes the cached keys/values themselves rather than the model weights, and can be
+combined with weight quantization or used alone:
+
+```bash
+sed -e 's/__NAME__/sft-kvfp8/g' -e 's/__RUN_ID__/<run_id from step 2>/g' \
+  -e 's/__VLLM_EXTRA_ARGS__/--kv-cache-dtype fp8_e4m3/g' \
+  configs/templates/inference/vllm-serve-checkpoint.yaml | kubectl apply -f -
+kubectl -n fin-agent rollout status deploy/fin-agent-vllm-sft-kvfp8 --timeout=900s
+```
+
 **2. Kill any stale local port-forwards, then start fresh ones — each in its own
 terminal, left running.** A `kubectl port-forward` left over from an earlier attempt can
 still be bound to these local ports while pointing at a pod that's gone:
@@ -427,20 +438,20 @@ tool-calling traffic, no custom conversion code — but sends tools via the nati
 calls (tools as text in the system message); realistic tool-calling-*shaped* load, not an
 exact replica of this model's production request format.
 
-**Comparing quantized against bf16.** Run the sweep twice — once against the bf16
-Deployment, once against the FP8 one from step 1 — labelling each so the two runs are
-distinguishable in MLflow:
+**Comparing quantized against bf16.** Run the sweep once per Deployment (bf16 /
+`--quantization fp8_per_tensor` / `--kv-cache-dtype fp8_e4m3`), labelling each so the runs
+are distinguishable in MLflow:
 
 ```bash
 # ... --base-url http://localhost:8000 (whichever server is port-forwarded) ...
-  --concurrencies 1,8,16,32,64 --label bf16          # then --label fp8_per_tensor
+  --concurrencies 1,8,16,32,64 --label bf16   # then fp8_per_tensor, then kv_cache_fp8
 ```
 
-Keep `--gpu-memory-utilization` identical (0.5) across both or the comparison confounds
-two variables. Expect the gain at *high* concurrency rather than in single-stream
-latency: FP8 weights free roughly 8GB, which at a fixed 0.5 utilisation grows the
-KV-cache pool by about a third, so it shows up as sustained throughput at 32–64
-concurrency, not as a lower TTFT at 1.
+Keep `--gpu-memory-utilization` identical (0.5) across all three or the comparison
+confounds two variables. The benchmark logs `kv_cache_usage_perc_mean`/`_max` (scraped
+from the server's own `/metrics`) alongside throughput/TTFT/TPOT — the number to check
+whether `--kv-cache-dtype fp8_e4m3` actually grows usable cache headroom, rather than
+inferring it from throughput alone.
 
 Tear the Deployment down when done:
 `kubectl -n fin-agent delete deployment fin-agent-vllm-sft && kubectl -n fin-agent delete

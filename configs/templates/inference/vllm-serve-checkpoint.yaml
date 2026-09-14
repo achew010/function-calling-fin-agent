@@ -19,6 +19,14 @@
 #       -e 's/__VLLM_EXTRA_ARGS__/--quantization fp8_per_tensor/g' \
 #       vllm-serve-checkpoint.yaml | kubectl apply -f -
 #
+# KV-cache in FP8 -- a separate, independent flag from --quantization above (that one
+# quantizes weights; this one quantizes the KV-cache entries themselves), combinable
+# with it. fp8_e4m3 with no --quantization-param-path uses default (1.0) scales --
+# vLLM's own documented default, no calibration dataset required:
+#   sed -e 's/__NAME__/sft-kvfp8/g' -e 's/__RUN_ID__/<run id>/g' \
+#       -e 's/__VLLM_EXTRA_ARGS__/--kv-cache-dtype fp8_e4m3/g' \
+#       vllm-serve-checkpoint.yaml | kubectl apply -f -
+#
 # The placeholder rides on the --max-model-len line rather than a line of its own: this
 # is a YAML FOLDED scalar (>-), where a line emptied by substitution folds to a NEWLINE
 # and would split the command (see bfcl-eval-mlflow-checkpoint-job.yaml's longer note).
